@@ -304,6 +304,8 @@ func (app *App) createStreamManager(babyUID string, conn *client.WebsocketConnec
 		RTMPServer:     app.rtmpServer,
 		StallThreshold: 3 * time.Second, // Switch to remote if no packets for 3s
 		OnAuthFailed:   app.onAuthFailed,
+
+		DisableRemoteRelay: app.Opts.RTMP.DisableRemoteRelay,
 	})
 
 	// Create a no-op remote relay since HybridStreamPool manages its own remote connection

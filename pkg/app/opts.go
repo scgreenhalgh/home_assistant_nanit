@@ -44,6 +44,14 @@ type RTMPOpts struct {
 	// Useful for testing source switching behavior
 	PreferRemote bool
 
+	// DisableRemoteRelay runs the stream pool local-only: the cloud relay
+	// hot-standby is never started, so the camera is never asked to publish to
+	// media-secured.nanit.com and the proxy never pulls video back through Nanit's
+	// cloud. Removes the proxy-induced camera->cloud media path (privacy) and frees
+	// a per-camera connection slot, at the cost of seamless failover when the local
+	// push stalls. Env: NANIT_DISABLE_REMOTE_RELAY (default false).
+	DisableRemoteRelay bool
+
 	// Security: IP-based access control
 	// AllowedIPs is a comma-separated list of IPs and/or CIDR ranges
 	// Example: "192.168.1.100,172.30.32.0/24"
