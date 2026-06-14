@@ -45,6 +45,11 @@ type HybridStreamPool struct {
 	onAuthFailed  func(err error)  // Called when auth fails completely
 	remoteRelay   RemoteRelay      // Interface, actual type is *RTMPRelay
 
+	// disableRemoteRelay runs the pool local-only: the remote relay is never
+	// started and the pool never switches to remote, so the camera is never asked
+	// to publish to the Nanit cloud media relay. Immutable after construction.
+	disableRemoteRelay bool
+
 	mu              sync.RWMutex
 	started         bool
 	activeSource    int  // HybridSourceLocal or HybridSourceRemote
@@ -75,6 +80,9 @@ type HybridStreamPoolConfig struct {
 	RTMPServer     *rtmpserver.RTMPServer
 	StallThreshold time.Duration
 	OnAuthFailed   func(err error) // Optional: called when auth fails completely
+
+	// DisableRemoteRelay runs the pool local-only (no cloud relay hot-standby).
+	DisableRemoteRelay bool
 }
 
 // NewHybridStreamPool creates a new hybrid stream pool
@@ -94,6 +102,8 @@ func NewHybridStreamPool(config HybridStreamPoolConfig) *HybridStreamPool {
 		rtmpServer:     config.RTMPServer,
 		stallThreshold: config.StallThreshold,
 		activeSource:   HybridSourceLocal, // Start with local as primary
+
+		disableRemoteRelay: config.DisableRemoteRelay,
 	}
 }
 
@@ -120,21 +130,28 @@ func (p *HybridStreamPool) RequestLocalStream(ctx context.Context) error {
 
 	// Request local stream (primary)
 	if err := p.requestLocalStream(); err != nil {
-		log.Warn().Err(err).Str("baby_uid", p.babyUID).Msg("Failed to start local stream, falling back to remote")
+		if p.disableRemoteRelay {
+			// Local-only: no remote to fall back to. Stay on local and let the
+			// rate-limited retry + health watchdog recover it.
+			log.Warn().Err(err).Str("baby_uid", p.babyUID).Msg("Failed to start local stream (remote relay disabled), will keep retrying local")
+			go p.tryRequestLocalStream()
+		} else {
+			log.Warn().Err(err).Str("baby_uid", p.babyUID).Msg("Failed to start local stream, falling back to remote")
 
-		// Actually switch to remote since local failed
-		p.mu.Lock()
-		p.activeSource = HybridSourceRemote
-		p.mu.Unlock()
+			// Actually switch to remote since local failed
+			p.mu.Lock()
+			p.activeSource = HybridSourceRemote
+			p.mu.Unlock()
 
-		// Update broadcaster to accept remote packets
-		if broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID); broadcaster != nil {
-			broadcaster.SetActiveSource(HybridSourceRemote)
-			log.Info().Str("baby_uid", p.babyUID).Msg("Switched active source to remote after local failure")
+			// Update broadcaster to accept remote packets
+			if broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID); broadcaster != nil {
+				broadcaster.SetActiveSource(HybridSourceRemote)
+				log.Info().Str("baby_uid", p.babyUID).Msg("Switched active source to remote after local failure")
+			}
+
+			// Publish stream source change to remote
+			p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Remote))
 		}
-
-		// Publish stream source change to remote
-		p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Remote))
 	}
 
 	// Start health watchdog to monitor and recover streams
@@ -196,6 +213,17 @@ func (p *HybridStreamPool) onStallDetected(sourceID int) {
 		// Local stalled - switch to remote
 		p.lastLocalStall = now
 		p.localStallCount++
+
+		if p.disableRemoteRelay {
+			// Local-only: there is no remote to switch to. Keep the active source
+			// on local and retry; recording resumes when the local push recovers.
+			log.Warn().
+				Str("baby_uid", p.babyUID).
+				Int("stall_count", p.localStallCount).
+				Msg("Local stream stalled (remote relay disabled), retrying local")
+			go p.tryRequestLocalStream()
+			return
+		}
 
 		log.Warn().
 			Str("baby_uid", p.babyUID).
@@ -262,6 +290,15 @@ func (p *HybridStreamPool) onStallDetected(sourceID int) {
 
 // startRemoteRelay starts the remote relay as hot standby
 func (p *HybridStreamPool) startRemoteRelay() {
+	// Local-only mode: never start the cloud relay. This is the single chokepoint
+	// for the remote connection, so leaving p.remoteRelay nil keeps remoteActive
+	// false everywhere and the camera is never asked to publish to Nanit's cloud.
+	// (disableRemoteRelay is immutable after construction, so reading it lock-free
+	// is safe.)
+	if p.disableRemoteRelay {
+		return
+	}
+
 	p.mu.Lock()
 
 	// Check if pool has been stopped

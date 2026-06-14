@@ -93,6 +93,10 @@ func main() {
 
 		preferRemote := utils.EnvVarBool("NANIT_PREFER_REMOTE", false)
 
+		// Local-only mode: never start the cloud relay hot-standby (no
+		// camera->media-secured.nanit.com publish, no proxy pull through Nanit cloud).
+		disableRemoteRelay := utils.EnvVarBool("NANIT_DISABLE_REMOTE_RELAY", false)
+
 		// Security: IP-based access control
 		allowedPresets := utils.EnvVarStr("NANIT_RTMP_ALLOWED_PRESETS", "")
 		allowedIPs := utils.EnvVarStr("NANIT_RTMP_ALLOWED_IPS", "")
@@ -111,16 +115,17 @@ func main() {
 			log.Warn().Msg("No RTMP security configured - set NANIT_RTMP_ALLOWED_PRESETS or NANIT_RTMP_ALLOWED_IPS")
 		}
 
-		log.Info().Bool("prefer_remote", preferRemote).Str("public_addr", publicAddr).Msg("RTMP streaming configuration")
+		log.Info().Bool("prefer_remote", preferRemote).Bool("disable_remote_relay", disableRemoteRelay).Str("public_addr", publicAddr).Msg("RTMP streaming configuration")
 
 		opts.RTMP = &app.RTMPOpts{
-			ListenAddr:     listenAddr,
-			PublicAddr:     publicAddr,
-			PreferRemote:   preferRemote,
-			AllowedPresets: allowedPresets,
-			AllowedIPs:     allowedIPs,
-			LogDenied:      logDenied,
-			LogAllowed:     logAllowed,
+			ListenAddr:         listenAddr,
+			PublicAddr:         publicAddr,
+			PreferRemote:       preferRemote,
+			DisableRemoteRelay: disableRemoteRelay,
+			AllowedPresets:     allowedPresets,
+			AllowedIPs:         allowedIPs,
+			LogDenied:          logDenied,
+			LogAllowed:         logAllowed,
 		}
 	}
 
