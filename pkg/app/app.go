@@ -148,26 +148,75 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 		// Websocket connection
 		ws := client.NewWebsocketConnectionManager(baby.UID, baby.CameraUID, app.SessionStore.Session, app.RestClient, app.BabyStateManager)
 
-		// One pacer per baby, shared by the pool of every websocket connection,
-		// so a reconnect does not reset the STARTED rate limit and backoff
-		pacer := stream.NewRequestPacer(stream.RequestPacerConfig{})
-
-		ws.WithReadyConnection(func(conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
-			app.runWebsocket(baby.UID, conn, pacer, childCtx)
-		})
-
 		if app.Opts.EventPolling.Enabled {
 			ctx.RunAsChild(func(childCtx utils.GracefulContext) {
 				app.pollMessages(childCtx, baby.UID, app.BabyStateManager)
 			})
 		}
 
-		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			ws.RunWithinContext(childCtx)
-		})
+		app.runBabyWebsocket(baby.UID, ws, ctx)
+		return
 	}
 
 	<-ctx.Done()
+}
+
+// websocketLoop - the part of client.WebsocketConnectionManager that handleBaby uses
+type websocketLoop interface {
+	WithReadyConnection(client.WebsocketConnectionHandler)
+	RunWithinContext(utils.GracefulContext)
+}
+
+// runBabyWebsocket - runs the websocket loop of one baby until ctx, which is
+// cancelled on shutdown, is done, then waits for the loop's cleanup
+func (app *App) runBabyWebsocket(babyUID string, ws websocketLoop, ctx utils.GracefulContext) {
+	// One pacer per baby, shared by the pool of every websocket connection,
+	// so a reconnect does not reset the STARTED rate limit and backoff
+	pacer := stream.NewRequestPacer(stream.RequestPacerConfig{})
+
+	ws.WithReadyConnection(func(conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
+		app.runWebsocket(babyUID, conn, pacer, childCtx, ctx)
+	})
+
+	wsRunner := ctx.RunAsChild(func(childCtx utils.GracefulContext) {
+		ws.RunWithinContext(childCtx)
+	})
+
+	<-ctx.Done()
+	// A parent does not wait for its grandchildren, so without this the process
+	// could exit before the websocket cleanup sent STOPPED.
+	waitForRunner(wsRunner, websocketShutdownTimeout)
+}
+
+// websocketShutdownTimeout - how long shutdown waits for the websocket cleanup
+var websocketShutdownTimeout = 5 * time.Second
+
+// waitForRunner - waits until runner returned, up to timeout
+func waitForRunner(runner utils.GracefulRunner, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		runner.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Warn().Dur("timeout", timeout).Msg("Websocket cleanup did not finish in time, shutting down anyway")
+	}
+}
+
+// isShuttingDown - reports whether shutdownCtx, the context that is cancelled on process
+// shutdown, is done. A parent's Done is closed before its children are cancelled, so a
+// child's cleanup sees true when shutdown caused it and false when only its own
+// websocket attempt ended.
+func isShuttingDown(shutdownCtx utils.GracefulContext) bool {
+	select {
+	case <-shutdownCtx.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 func (app *App) pollMessages(ctx utils.GracefulContext, babyUID string, babyStateManager *baby.StateManager) {
@@ -196,7 +245,7 @@ func (app *App) pollMessages(ctx utils.GracefulContext, babyUID string, babyStat
 	}
 }
 
-func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, pacer *stream.RequestPacer, childCtx utils.GracefulContext) {
+func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, pacer *stream.RequestPacer, childCtx utils.GracefulContext, shutdownCtx utils.GracefulContext) {
 	// Reading sensor data
 	conn.RegisterMessageHandler(func(m *client.Message, conn *client.WebsocketConnection) {
 		// Sensor request initiated by us on start (or some other client, we don't care)
@@ -262,7 +311,7 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, p
 
 	// Streaming (local with remote failover)
 	if app.Opts.RTMP != nil {
-		pool := app.createHybridPool(babyUID, conn, pacer)
+		pool := newStreamPool(app, babyUID, conn, pacer)
 
 		// Convert GracefulContext to standard context
 		ctx, cancel := context.WithCancel(context.Background())
@@ -275,8 +324,16 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, p
 		pool.RequestLocalStream(ctx)
 
 		cleanup = func() {
-			// No STOPPED is sent here: by the time cleanup runs the websocket is
-			// already closing, and on a reconnect the next pool keeps the push.
+			if isShuttingDown(shutdownCtx) {
+				// Release the camera's stream session. The websocket stays open
+				// until this returns (see client.closeAfterHandlers).
+				stopCtx, cancel := context.WithTimeout(context.Background(), streamStopTimeout)
+				defer cancel()
+				pool.StopLocalStream(stopCtx)
+				return
+			}
+			// Only the websocket attempt ended: no STOPPED, because on the
+			// reconnect the next pool keeps the camera's push.
 			pool.Close()
 		}
 	}
@@ -286,6 +343,21 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, p
 		cleanup()
 	}
 }
+
+// streamPool - the part of stream.HybridStreamPool that runWebsocket uses
+type streamPool interface {
+	RequestLocalStream(context.Context) error
+	StopLocalStream(context.Context) error
+	Close()
+}
+
+// newStreamPool - creates the stream pool of a websocket connection; tests replace it
+var newStreamPool = func(app *App, babyUID string, conn *client.WebsocketConnection, pacer *stream.RequestPacer) streamPool {
+	return app.createHybridPool(babyUID, conn, pacer)
+}
+
+// streamStopTimeout - bound on sending STOPPED and waiting for its reply on shutdown
+const streamStopTimeout = 3 * time.Second
 
 // createHybridPool creates the stream pool for the given baby: local as primary,
 // remote as hot standby (different network paths). It owns StreamType and StreamState.
