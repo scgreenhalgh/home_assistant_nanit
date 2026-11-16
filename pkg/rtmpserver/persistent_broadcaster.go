@@ -58,6 +58,7 @@ type PersistentBroadcaster struct {
 
 	// Diagnostic tracking
 	lastPacketWallTime time.Time
+	lastVideoBySource  map[int]time.Time // wall time of the last video packet received per source, before filtering
 	droppedPackets     int64
 
 	// Stall detection
@@ -125,9 +126,11 @@ func (pb *PersistentBroadcaster) RequestSourceSwitch(sourceID int) {
 		return
 	}
 
-	// If already on this source, nothing to do
+	// If already on this source, cancel any pending switch away from it
 	if pb.activeSourceSet && pb.activeSourceID == sourceID {
 		log.Debug().Str("baby_uid", pb.babyUID).Int("source_id", sourceID).Msg("Already on requested source")
+		pb.pendingSourceSwitch = false
+		pb.pendingSourceID = 0
 		return
 	}
 
@@ -294,6 +297,13 @@ func (pb *PersistentBroadcaster) Broadcast(pkt av.Packet, sourceID int) {
 
 	// Check source filtering and handle keyframe-aligned switching
 	pb.tsMu.Lock()
+
+	if pkt.Type == av.H264 {
+		if pb.lastVideoBySource == nil {
+			pb.lastVideoBySource = make(map[int]time.Time)
+		}
+		pb.lastVideoBySource[sourceID] = time.Now()
+	}
 
 	// Check for pending source switch - if this is a keyframe from the pending source, complete the switch
 	if pb.pendingSourceSwitch && sourceID == pb.pendingSourceID && pkt.IsKeyFrame {
@@ -552,6 +562,53 @@ func (pb *PersistentBroadcaster) GetBroadcastFunc(sourceID int) func(pkt av.Pack
 	return func(pkt av.Packet) {
 		pb.Broadcast(pkt, sourceID)
 	}
+}
+
+// ClearStallConfig disables stall detection, but only if config is still the
+// installed one, so a stale owner cannot remove a newer owner's callback.
+func (pb *PersistentBroadcaster) ClearStallConfig(config *StallConfig) {
+	pb.stallMu.Lock()
+	defer pb.stallMu.Unlock()
+
+	pb.tsMu.Lock()
+	current := pb.stallConfig
+	pb.tsMu.Unlock()
+	if config == nil || current != config {
+		return
+	}
+
+	if pb.stallCheckStop != nil {
+		close(pb.stallCheckStop)
+		pb.stallCheckStop = nil
+		pb.stallCheckWg.Wait()
+	}
+	pb.tsMu.Lock()
+	pb.stallConfig = nil
+	pb.stallDetected = false
+	pb.tsMu.Unlock()
+}
+
+// SourceAge returns how long ago the last VIDEO packet from sourceID was
+// received, whether or not it was forwarded; audio does not count, so frozen
+// video with live audio reads as stale. seen is false if none was received.
+func (pb *PersistentBroadcaster) SourceAge(sourceID int) (age time.Duration, seen bool) {
+	pb.tsMu.Lock()
+	defer pb.tsMu.Unlock()
+	t, ok := pb.lastVideoBySource[sourceID]
+	if !ok {
+		return 0, false
+	}
+	return time.Since(t), true
+}
+
+// PendingSourceID returns the source a pending switch waits for, or 0 if none
+func (pb *PersistentBroadcaster) PendingSourceID() int {
+	pb.tsMu.Lock()
+	defer pb.tsMu.Unlock()
+	if !pb.pendingSourceSwitch {
+		return 0
+	}
+	return pb.pendingSourceID
 }
 
 // ActiveSourceID returns the current active source ID, or 0 if not set
