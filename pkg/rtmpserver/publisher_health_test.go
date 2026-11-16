@@ -164,3 +164,36 @@ func TestSourceAge_IgnoresAudio(t *testing.T) {
 	_, seen := pb.SourceAge(21)
 	assert.False(t, seen, "audio packets must not count as a healthy source")
 }
+
+// Only the release of the last claim runs final; until then the handler stays
+// silent, and after it the handler writes again.
+func TestStreamStateClaims_OnlyLastReleaseRunsFinal(t *testing.T) {
+	sm := baby.NewStateManager()
+	srv := &RTMPServer{handler: newRtmpHandler(sm)}
+	addr := startTestRTMPServer(t, srv.handler)
+	const uid = "baby123"
+	claimed := func() bool {
+		srv.handler.localPublishersMu.RLock()
+		defer srv.handler.localPublishersMu.RUnlock()
+		return srv.handler.streamStateClaims[uid] > 0
+	}
+
+	srv.ClaimStreamState(uid)
+	srv.ClaimStreamState(uid)
+	calls := 0
+	srv.ReleaseStreamState(uid, func(bool) { calls++ })
+	assert.Equal(t, 0, calls, "final must not run while another claim remains")
+	assert.True(t, claimed(), "the handler must stay silent while another claim remains")
+
+	_, nc := publish(t, addr, uid)
+	require.Eventually(t, func() bool { return srv.handler.IsLocalPublisherActive(uid) }, 3*time.Second, 5*time.Millisecond)
+	connected := false
+	srv.ReleaseStreamState(uid, func(c bool) { calls++; connected = c })
+	assert.Equal(t, 1, calls, "the last release runs final once")
+	assert.True(t, connected, "final sees the connected publisher")
+	assert.False(t, claimed())
+
+	nc.Close()
+	require.Eventually(t, func() bool { return streamState(sm, uid) == baby.StreamState_Unhealthy }, 3*time.Second, 5*time.Millisecond,
+		"the handler writes again after the last release")
+}

@@ -901,3 +901,267 @@ func TestHybridPool_StallCallbackFollowUp(t *testing.T) {
 	require.Eventually(t, func() bool { s, _ := h.state(); return s == baby.StreamState_Unhealthy }, time.Second, 5*time.Millisecond,
 		"follow-up evaluation must notice local left the window")
 }
+
+// --- stream state writer ---
+
+// stateRecorder keeps every StreamState and StreamType update for the test baby.
+// The state manager calls each subscriber on its own goroutine, so two updates
+// close together can be recorded out of order. The tests therefore wait for
+// each expected update before they cause the next one: then the recorded order
+// is the real order, and any extra update makes the sequence longer.
+type stateRecorder struct {
+	mu     sync.Mutex
+	states []baby.StreamState
+	types  []baby.StreamType
+}
+
+// recordStreamState subscribes before any state exists, so nothing is replayed.
+func recordStreamState(t *testing.T, sm *baby.StateManager) *stateRecorder {
+	r := &stateRecorder{}
+	t.Cleanup(sm.Subscribe(func(babyUID string, s baby.State) {
+		if babyUID != testBabyUID {
+			return
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if s.StreamState != nil {
+			r.states = append(r.states, s.GetStreamState())
+		}
+		if s.StreamType != nil {
+			r.types = append(r.types, s.GetStreamType())
+		}
+	}))
+	return r
+}
+
+func (r *stateRecorder) get() ([]baby.StreamState, []baby.StreamType) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]baby.StreamState(nil), r.states...), append([]baby.StreamType(nil), r.types...)
+}
+
+// waitState waits until the last recorded StreamState is want.
+func (r *stateRecorder) waitState(t *testing.T, want baby.StreamState, msg string) {
+	t.Helper()
+	require.Eventually(t, func() bool { s, _ := r.get(); return len(s) > 0 && s[len(s)-1] == want }, waitTimeout, 5*time.Millisecond, msg)
+}
+
+// waitType waits until the last recorded StreamType is want.
+func (r *stateRecorder) waitType(t *testing.T, want baby.StreamType, msg string) {
+	t.Helper()
+	require.Eventually(t, func() bool { _, ty := r.get(); return len(ty) > 0 && ty[len(ty)-1] == want }, waitTimeout, 5*time.Millisecond, msg)
+}
+
+// serveRTMP runs the harness RTMP server on a loopback port.
+func (h *harness) serveRTMP() string {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(h.t, err)
+	addr := lis.Addr().String()
+	lis.Close()
+	go h.srv.Run(addr)
+	h.t.Cleanup(func() { h.srv.Close() })
+	return addr
+}
+
+// publisher is a real RTMP push to the harness server, like the camera's.
+type publisher struct {
+	nc    net.Conn
+	video *feeder
+}
+
+// connectPublisher dials and waits until the handler has registered the publisher.
+func (h *harness) connectPublisher(addr string) *publisher {
+	before := h.srv.LocalPublisherConnectedAt(testBabyUID)
+	var conn *rtmp.Conn
+	var nc net.Conn
+	require.Eventually(h.t, func() bool {
+		var err error
+		conn, nc, err = rtmp.NewClient().Dial("rtmp://"+addr+"/local/"+testBabyUID, rtmp.PrepareWriting)
+		return err == nil
+	}, waitTimeout, 20*time.Millisecond)
+	// The client buffers 4 KiB before it writes: big packets make each one reach
+	// the server at once (only the tail waits for the next packet).
+	send := func(pkt av.Packet) {
+		pkt.Data = append(pkt.Data, make([]byte, 2*rtmp.BufioSize)...)
+		_ = conn.WritePacket(pkt)
+	}
+	p := &publisher{nc: nc, video: &feeder{send: send, marker: 'L', keyframes: true}}
+	h.t.Cleanup(p.disconnect)
+	require.Eventually(h.t, func() bool { return h.srv.LocalPublisherConnectedAt(testBabyUID).After(before) }, waitTimeout, 5*time.Millisecond,
+		"handler registered the publisher")
+	return p
+}
+
+// disconnect stops the video and closes the connection at the same moment, like a camera dropping.
+func (p *publisher) disconnect() {
+	p.video.halt()
+	p.nc.Close()
+}
+
+// waitPublisherGone waits until the handler has unregistered every publisher.
+func (h *harness) waitPublisherGone() {
+	require.Eventually(h.t, func() bool { return h.srv.WaitForPublisher(testBabyUID, 0) != nil }, waitTimeout, 5*time.Millisecond,
+		"handler unregistered the publisher")
+}
+
+// S1: with the relay disabled, connect -> nothing until the first video ->
+// Alive; last disconnect -> Unhealthy once, when the health window ends.
+func TestHybridPool_StreamState_LocalOnly_NoFlap(t *testing.T) {
+	h := newHarness(t, nil)
+	rec := recordStreamState(t, h.sm)
+	addr := h.serveRTMP()
+	h.start()
+	rec.waitState(t, baby.StreamState_Unhealthy, "pool starts Unhealthy with nothing flowing")
+
+	pub := h.connectPublisher(addr)
+	time.Sleep(100 * time.Millisecond) // several watchdog ticks, connected but no video
+	s, _ := rec.get()
+	assert.Equal(t, []baby.StreamState{baby.StreamState_Unhealthy}, s, "a connect without video must publish nothing")
+
+	pub.video.start()
+	rec.waitState(t, baby.StreamState_Alive, "Alive at the first video")
+
+	pub.disconnect()
+	rec.waitState(t, baby.StreamState_Unhealthy, "Unhealthy after the last disconnect")
+	time.Sleep(2 * testConfig().HealthWindow) // let any late correction land
+
+	s, ty := rec.get()
+	assert.Equal(t, []baby.StreamState{baby.StreamState_Unhealthy, baby.StreamState_Alive, baby.StreamState_Unhealthy}, s, "StreamState sequence")
+	assert.Equal(t, []baby.StreamType{baby.StreamType_Local}, ty, "StreamType sequence")
+}
+
+// S2: with a healthy remote source, the local publisher coming and going only
+// moves StreamType; StreamState stays Alive.
+func TestHybridPool_StreamState_RemoteHealthy_StaysAlive(t *testing.T) {
+	h := newHarness(t, nil)
+	rec := recordStreamState(t, h.sm)
+	addr := h.serveRTMP()
+	h.start()
+	rec.waitState(t, baby.StreamState_Unhealthy, "pool starts Unhealthy with nothing flowing")
+	h.remote.start()
+	rec.waitType(t, baby.StreamType_Remote, "on remote")
+	rec.waitState(t, baby.StreamState_Alive, "Alive on remote")
+
+	pub := h.connectPublisher(addr)
+	pub.video.start()
+	rec.waitType(t, baby.StreamType_Local, "on local at the first video")
+
+	pub.disconnect()
+	rec.waitType(t, baby.StreamType_Remote, "back on remote when the window ends")
+	time.Sleep(2 * testConfig().HealthWindow)
+
+	s, ty := rec.get()
+	assert.Equal(t, []baby.StreamState{baby.StreamState_Unhealthy, baby.StreamState_Alive}, s, "StreamState sequence")
+	assert.Equal(t, []baby.StreamType{baby.StreamType_Local, baby.StreamType_Remote, baby.StreamType_Local, baby.StreamType_Remote}, ty, "StreamType sequence")
+}
+
+// S3: with no pool running, the RTMP handler writes the state as before.
+func TestHybridPool_StreamState_NoPool_HandlerWrites(t *testing.T) {
+	h := newHarness(t, nil) // the pool is never started
+	rec := recordStreamState(t, h.sm)
+	addr := h.serveRTMP()
+
+	pub := h.connectPublisher(addr)
+	rec.waitState(t, baby.StreamState_Alive, "Alive on connect")
+	pub.disconnect()
+	rec.waitState(t, baby.StreamState_Unhealthy, "Unhealthy on the last disconnect")
+
+	s, _ := rec.get()
+	assert.Equal(t, []baby.StreamState{baby.StreamState_Alive, baby.StreamState_Unhealthy}, s)
+}
+
+// S4: after Close the handler writes again: the last disconnect publishes Unhealthy.
+func TestHybridPool_StreamState_AfterClose_HandlerWrites(t *testing.T) {
+	h := newHarness(t, nil)
+	addr := h.serveRTMP()
+	h.start()
+	pub := h.connectPublisher(addr)
+	pub.video.start()
+	h.waitState(baby.StreamState_Alive, "Alive with video")
+
+	stopWithin(t, h.pool.Close)
+	st, _ := h.state()
+	require.Equal(t, baby.StreamState_Alive, st, "publisher connected and healthy at Close")
+
+	pub.disconnect()
+	h.waitState(baby.StreamState_Unhealthy, "the handler must publish Unhealthy once the pool is closed")
+}
+
+// S4: after StopLocalStream the handler writes again: a connect publishes Alive.
+func TestHybridPool_StreamState_AfterStop_HandlerWrites(t *testing.T) {
+	h := newHarness(t, nil)
+	addr := h.serveRTMP()
+	h.start()
+	stopWithin(t, func() { _ = h.pool.StopLocalStream(context.Background()) })
+	st, _ := h.state()
+	require.Equal(t, baby.StreamState_Unhealthy, st)
+
+	h.connectPublisher(addr)
+	h.waitState(baby.StreamState_Alive, "the handler must publish Alive once the pool is stopped")
+}
+
+// S4: the last publisher leaves, then the pool closes while its last packet is
+// still inside the health window: the state must not be left at Alive.
+func TestHybridPool_StreamState_CloseAfterDisconnect_Unhealthy(t *testing.T) {
+	h := newHarness(t, func(c *HybridStreamPoolConfig) { c.HealthWindow = time.Second })
+	addr := h.serveRTMP()
+	h.start()
+	pub := h.connectPublisher(addr)
+	pub.video.start()
+	h.waitState(baby.StreamState_Alive, "Alive with video")
+
+	pub.disconnect()
+	h.waitPublisherGone()
+	stopWithin(t, h.pool.Close) // the last packet is still inside the window
+	h.waitState(baby.StreamState_Unhealthy, "no publisher after Close: Unhealthy")
+	time.Sleep(100 * time.Millisecond)
+	st, _ := h.state()
+	assert.Equal(t, baby.StreamState_Unhealthy, st, "nothing may move it back to Alive")
+}
+
+// S4: a publisher is connected but has sent no video when the pool closes. The
+// handler owns the state from then on and writes only when a publisher comes
+// or goes, so the hand-over value follows its rule: connected means Alive.
+func TestHybridPool_StreamState_CloseBeforeFirstVideo_Alive(t *testing.T) {
+	h := newHarness(t, nil)
+	addr := h.serveRTMP()
+	h.start()
+	h.waitState(baby.StreamState_Unhealthy, "nothing flows")
+	h.connectPublisher(addr)
+
+	stopWithin(t, h.pool.Close)
+	st, ty := h.state()
+	assert.Equal(t, baby.StreamState_Alive, st, "a publisher is connected after Close: Alive")
+	assert.Equal(t, baby.StreamType_Local, ty)
+}
+
+// S5: a connect, a short drop and a reconnect do not change when STARTED is
+// sent: one at start (nothing flowing), none after, because local stays inside
+// the health window across the drop.
+func TestHybridPool_ShortDrop_StartedUnchanged(t *testing.T) {
+	h := newHarness(t, func(c *HybridStreamPoolConfig) {
+		c.PublisherGrace = 50 * time.Millisecond
+		c.HealthWindow = 400 * time.Millisecond
+		c.PublisherWait = time.Second // the first request waits for the packets below
+	})
+	addr := h.serveRTMP()
+	h.start()
+	h.waitStarted(1, "STARTED at start: nothing flows")
+
+	pub := h.connectPublisher(addr)
+	connected := h.srv.LocalPublisherConnectedAt(testBabyUID)
+	pub.video.start()
+	h.waitState(baby.StreamState_Alive, "Alive with video")
+
+	pub.disconnect()
+	h.waitPublisherGone()
+	time.Sleep(100 * time.Millisecond) // the drop, shorter than the window
+	pub = h.connectPublisher(addr)
+	pub.video.start()
+	time.Sleep(500 * time.Millisecond) // longer than the window and the grace
+
+	reqs := h.req.all()
+	require.Len(t, reqs, 1, "exactly one STARTED for connect / short drop / reconnect")
+	assert.Equal(t, client.Streaming_STARTED, reqs[0].Status)
+	assert.True(t, reqs[0].At.Before(connected), "the STARTED was sent before the first connect")
+}

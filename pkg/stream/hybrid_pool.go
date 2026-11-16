@@ -148,6 +148,8 @@ func (p *HybridStreamPool) RequestLocalStream(ctx context.Context) error {
 		return nil
 	}
 	p.started = true
+	// The pool is the only writer of StreamState until shutdown releases it.
+	p.cfg.RTMPServer.ClaimStreamState(p.cfg.BabyUID)
 	p.ctx, p.cancel = context.WithCancel(ctx)
 	p.stallConfig = &rtmpserver.StallConfig{
 		Threshold: p.cfg.StallThreshold,
@@ -462,14 +464,18 @@ func (p *HybridStreamPool) shutdown(stopping bool) bool {
 	p.evalMu.Lock()
 	defer p.evalMu.Unlock()
 	p.pointFilter(b, HybridSourceLocal, true)
-	switch {
-	case stopping:
-		p.publish(baby.StreamType_None, baby.StreamState_Unhealthy)
-	case p.sourceHealthy(b, HybridSourceLocal):
-		p.publish(baby.StreamType_Local, baby.StreamState_Alive)
-	default:
-		p.publish(baby.StreamType_Local, baby.StreamState_Unhealthy)
-	}
+	// Hand StreamState back to the RTMP handler with its own rule: it writes only
+	// when a publisher connects or leaves, so a connected publisher means Alive.
+	p.cfg.RTMPServer.ReleaseStreamState(p.cfg.BabyUID, func(publisherConnected bool) {
+		switch {
+		case stopping:
+			p.publish(baby.StreamType_None, baby.StreamState_Unhealthy)
+		case publisherConnected:
+			p.publish(baby.StreamType_Local, baby.StreamState_Alive)
+		default:
+			p.publish(baby.StreamType_Local, baby.StreamState_Unhealthy)
+		}
+	})
 	return true
 }
 

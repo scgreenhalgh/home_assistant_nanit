@@ -53,6 +53,7 @@ type rtmpHandler struct {
 	localPublishersMu sync.RWMutex
 	localPublishers   map[string]int       // count of active publishers per baby
 	lastLocalConnect  map[string]time.Time // when a local publisher last connected, per baby
+	streamStateClaims map[string]int       // claims on StreamState per baby; the handler writes it only at 0
 }
 
 // StartRTMPServer - Blocking server (legacy, starts in background and returns RTMPServer for access)
@@ -275,6 +276,33 @@ func (srv *RTMPServer) LocalPublisherConnectedAt(babyUID string) time.Time {
 	return srv.handler.lastLocalConnect[babyUID]
 }
 
+// ClaimStreamState makes the caller the writer of the baby's StreamState: the
+// publish handler stops writing it until the last claim is released. Claims
+// are counted. When it returns, a handler write that had begun is complete,
+// so the caller's next write lands after it.
+func (srv *RTMPServer) ClaimStreamState(babyUID string) {
+	srv.handler.localPublishersMu.Lock()
+	defer srv.handler.localPublishersMu.Unlock()
+	srv.handler.streamStateClaims[babyUID]++
+}
+
+// ReleaseStreamState drops one claim. If it was the last, final runs with
+// whether a local publisher is connected, before the handler can write again
+// and while no publisher can connect or leave: every later handler write lands
+// after final's. While other claims remain, final does not run. final must not
+// call back into the RTMPServer.
+func (srv *RTMPServer) ReleaseStreamState(babyUID string, final func(publisherConnected bool)) {
+	h := srv.handler
+	h.localPublishersMu.Lock()
+	defer h.localPublishersMu.Unlock()
+	h.streamStateClaims[babyUID]--
+	if h.streamStateClaims[babyUID] > 0 {
+		return
+	}
+	delete(h.streamStateClaims, babyUID)
+	final(h.localPublishers[babyUID] > 0)
+}
+
 // ErrPublisherTimeout is returned when waiting for publisher times out
 var ErrPublisherTimeout = net.UnknownNetworkError("publisher connection timeout")
 
@@ -341,6 +369,7 @@ func newRtmpHandler(babyStateManager *baby.StateManager) *rtmpHandler {
 		publisherWaitCh:   make(map[string]chan struct{}),
 		localPublishers:   make(map[string]int),
 		lastLocalConnect:  make(map[string]time.Time),
+		streamStateClaims: make(map[string]int),
 	}
 }
 
@@ -387,7 +416,7 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 		}
 		s.publisherWaitMu.Unlock()
 
-		s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Alive))
+		s.updateStreamState(babyUID, baby.StreamState_Alive)
 
 		for {
 			pkt, err := c.ReadPacket()
@@ -401,7 +430,7 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 				} else {
 					// No other publisher - this is an actual stream drop
 					sublog.Warn().Err(err).Msg("Local publisher stream closed (no replacement)")
-					s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Unhealthy))
+					s.updateStreamState(babyUID, baby.StreamState_Unhealthy)
 				}
 				return
 			}
@@ -510,6 +539,18 @@ func (s *rtmpHandler) getNewSubscriber(babyUID string) *Subscription {
 	}
 
 	return pb.Subscribe()
+}
+
+// updateStreamState writes StreamState unless a stream pool has claimed it.
+// The check and the write are one step against ClaimStreamState and
+// ReleaseStreamState. The caller must not hold localPublishersMu.
+func (s *rtmpHandler) updateStreamState(babyUID string, state baby.StreamState) {
+	s.localPublishersMu.RLock()
+	defer s.localPublishersMu.RUnlock()
+	if s.streamStateClaims[babyUID] > 0 {
+		return
+	}
+	s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(state))
 }
 
 // IsLocalPublisherActive returns whether a local publisher is currently active for the baby
