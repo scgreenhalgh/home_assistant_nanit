@@ -5,6 +5,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -170,7 +171,7 @@ func main() {
 	}
 
 	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 
 	instance, err := app.NewApp(opts)
 	if err != nil {
@@ -179,8 +180,25 @@ func main() {
 
 	runner := utils.RunWithGracefulCancel(instance.Run)
 
-	<-interrupt
-	log.Warn().Msg("Received interrupt signal, terminating")
+	os.Exit(waitForShutdown(interrupt, runner))
+}
+
+// waitForShutdown blocks until a signal arrives or the application stops by itself,
+// and returns the process exit code.
+func waitForShutdown(interrupt <-chan os.Signal, runner utils.GracefulRunner) int {
+	stopped := make(chan struct{})
+	go func() {
+		runner.Wait()
+		close(stopped)
+	}()
+
+	select {
+	case <-interrupt:
+		log.Warn().Msg("Received termination signal, terminating")
+	case <-stopped:
+		log.Error().Msg("Application stopped unexpectedly, exiting")
+		return 1
+	}
 
 	waitForCleanup := make(chan struct{}, 1)
 
@@ -191,9 +209,10 @@ func main() {
 
 	select {
 	case <-interrupt:
-		log.Fatal().Msg("Received another interrupt signal, forcing termination without clean up")
+		log.Error().Msg("Received another signal, forcing termination without clean up")
+		return 1
 	case <-waitForCleanup:
 		log.Info().Msg("Clean exit")
-		return
+		return 0
 	}
 }
