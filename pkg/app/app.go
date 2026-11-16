@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/scgreenhalgh/home_assistant_nanit/pkg/baby"
@@ -29,10 +28,6 @@ type App struct {
 	// RTMP server reference for remote streaming support
 	rtmpServer *rtmpserver.RTMPServer
 
-	// Stream managers per baby (for failover support)
-	streamManagersMu sync.RWMutex
-	streamManagers   map[string]*stream.StreamManager
-
 	// Notification manager for event polling
 	notificationManager *notification.Manager
 }
@@ -55,7 +50,6 @@ func NewApp(opts Opts) (*App, error) {
 			RefreshToken: opts.NanitCredentials.RefreshToken,
 			SessionStore: sessionStore,
 		},
-		streamManagers: make(map[string]*stream.StreamManager),
 	}
 
 	if opts.MQTT != nil {
@@ -81,6 +75,10 @@ func (app *App) Run(ctx utils.GracefulContext) {
 
 	// RTMP
 	if app.Opts.RTMP != nil {
+		if app.Opts.RTMP.PreferRemote {
+			log.Warn().Msg("PreferRemote has no effect: the local stream is always primary, with the cloud stream as hot standby")
+		}
+
 		// Use new secure server if any security options are configured
 		if app.Opts.RTMP.AllowedIPs != "" || app.Opts.RTMP.AllowedPresets != "" {
 			serverCfg := rtmpserver.ServerConfig{
@@ -260,8 +258,7 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 
 	// Streaming (local with remote failover)
 	if app.Opts.RTMP != nil {
-		// Create StreamManager for this baby
-		sm := app.createStreamManager(babyUID, conn)
+		pool := app.createHybridPool(babyUID, conn)
 
 		// Convert GracefulContext to standard context
 		ctx, cancel := context.WithCancel(context.Background())
@@ -270,16 +267,13 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 			cancel()
 		}()
 
-		// Start the stream manager
-		go func() {
-			if err := sm.Start(ctx); err != nil {
-				// Error logged inside StreamManager
-			}
-		}()
+		// Returns at once; the pool asks the camera only if local is not flowing
+		pool.RequestLocalStream(ctx)
 
 		cleanup = func() {
-			sm.Stop()
-			app.removeStreamManager(babyUID)
+			// No STOPPED is sent here: by the time cleanup runs the websocket is
+			// already closing, and on a reconnect the next pool keeps the push.
+			pool.Close()
 		}
 	}
 
@@ -289,12 +283,10 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 	}
 }
 
-// createStreamManager creates a StreamManager for the given baby
-func (app *App) createStreamManager(babyUID string, conn *client.WebsocketConnection) *stream.StreamManager {
-	// Use HybridStreamPool - local as primary, remote as hot standby
-	// This provides true redundancy since local and remote use different network paths
-	// When local stalls (camera issues), it seamlessly switches to remote using keyframe-aligned switching
-	hybridPool := stream.NewHybridStreamPool(stream.HybridStreamPoolConfig{
+// createHybridPool creates the stream pool for the given baby: local as primary,
+// remote as hot standby (different network paths). It owns StreamType and StreamState.
+func (app *App) createHybridPool(babyUID string, conn *client.WebsocketConnection) *stream.HybridStreamPool {
+	return stream.NewHybridStreamPool(stream.HybridStreamPoolConfig{
 		BabyUID:        babyUID,
 		LocalURL:       app.getLocalStreamURL(babyUID), // e.g., rtmp://host/local/babyUID
 		AuthToken:      app.SessionStore.GetAuthToken(),
@@ -302,36 +294,9 @@ func (app *App) createStreamManager(babyUID string, conn *client.WebsocketConnec
 		Conn:           conn,
 		StateManager:   app.BabyStateManager,
 		RTMPServer:     app.rtmpServer,
-		StallThreshold: 3 * time.Second, // Switch to remote if no packets for 3s
+		StallThreshold: 3 * time.Second, // Re-evaluate if no packets for 3s
 		OnAuthFailed:   app.onAuthFailed,
 	})
-
-	// Create a no-op remote relay since HybridStreamPool manages its own remote connection
-	// The StreamManager still expects a RemoteRelay but HybridStreamPool handles failover internally
-	noopRelay := stream.NewNoopRelay()
-
-	// Create the stream manager
-	sm := stream.NewStreamManager(stream.StreamManagerConfig{
-		BabyUID:       babyUID,
-		StateManager:  app.BabyStateManager,
-		LocalStreamer: hybridPool,
-		RemoteRelay:   noopRelay,
-		PreferRemote:  app.Opts.RTMP.PreferRemote,
-	})
-
-	// Store reference
-	app.streamManagersMu.Lock()
-	app.streamManagers[babyUID] = sm
-	app.streamManagersMu.Unlock()
-
-	return sm
-}
-
-// removeStreamManager removes the StreamManager for the given baby
-func (app *App) removeStreamManager(babyUID string) {
-	app.streamManagersMu.Lock()
-	delete(app.streamManagers, babyUID)
-	app.streamManagersMu.Unlock()
 }
 
 // getRemoteStreamURL builds the remote stream URL
