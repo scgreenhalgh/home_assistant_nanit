@@ -435,12 +435,23 @@ func (p *HybridStreamPool) runHealthWatchdog(ctx context.Context) {
 // exists, and publishes the final state. It reports whether this call stopped
 // a running pool. An in-flight STARTED is not waited for.
 func (p *HybridStreamPool) shutdown(stopping bool) bool {
+	tearDown := p.markClosed()
+	if tearDown == nil {
+		return false
+	}
+	tearDown(stopping)
+	return true
+}
+
+// markClosed marks the pool closed, so no STARTED is sent after it returns, and
+// returns the rest of the shutdown. It returns nil if the pool was not running.
+func (p *HybridStreamPool) markClosed() func(stopping bool) {
 	p.mu.Lock()
 	wasRunning := p.started && !p.closed
 	p.closed = true
 	if !wasRunning {
 		p.mu.Unlock()
-		return false
+		return nil
 	}
 	p.cancel()
 	remoteRelay := p.remoteRelay
@@ -449,6 +460,12 @@ func (p *HybridStreamPool) shutdown(stopping bool) bool {
 	unsubscribe := p.unsubscribe
 	p.mu.Unlock()
 
+	return func(stopping bool) {
+		p.tearDown(remoteRelay, stallConfig, unsubscribe, stopping)
+	}
+}
+
+func (p *HybridStreamPool) tearDown(remoteRelay RemoteRelay, stallConfig *rtmpserver.StallConfig, unsubscribe func(), stopping bool) {
 	unsubscribe()
 	b := p.broadcaster()
 	// Only removes our own callback; a newer pool may already own the broadcaster.
@@ -470,7 +487,6 @@ func (p *HybridStreamPool) shutdown(stopping bool) bool {
 	default:
 		p.publish(baby.StreamType_Local, baby.StreamState_Unhealthy)
 	}
-	return true
 }
 
 // Close stops the pool without telling the camera. Use it when the websocket is
@@ -483,8 +499,11 @@ func (p *HybridStreamPool) Close() {
 
 // StopLocalStream stops the pool and tells the camera to stop pushing to our URL,
 // waiting for the reply up to StopTimeout or until ctx is cancelled. It is idempotent.
+// STOPPED is sent before the tear-down, which can be slow (a relay stuck in a dial);
+// if ctx is cancelled first, the tear-down finishes in the background.
 func (p *HybridStreamPool) StopLocalStream(ctx context.Context) error {
-	if !p.shutdown(true) {
+	tearDown := p.markClosed()
+	if tearDown == nil {
 		return nil
 	}
 
@@ -505,6 +524,11 @@ func (p *HybridStreamPool) StopLocalStream(ctx context.Context) error {
 		_, err := awaitResponse(p.cfg.StopTimeout)
 		replied <- err
 	}()
+	tornDown := make(chan struct{})
+	go func() {
+		tearDown(true)
+		close(tornDown)
+	}()
 	select {
 	case err := <-replied:
 		if err != nil {
@@ -512,6 +536,17 @@ func (p *HybridStreamPool) StopLocalStream(ctx context.Context) error {
 		}
 	case <-ctx.Done():
 		log.Warn().Str("baby_uid", p.cfg.BabyUID).Msg("Stopped waiting for local stream stop confirmation")
+	}
+	select {
+	case <-tornDown:
+	default:
+		// Not done yet: wait for it, but not longer than the caller permits.
+		select {
+		case <-tornDown:
+		case <-ctx.Done():
+			log.Warn().Str("baby_uid", p.cfg.BabyUID).Msg("Pool tear-down still running, leaving it to finish")
+			return nil
+		}
 	}
 
 	log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Hybrid stream pool stopped")

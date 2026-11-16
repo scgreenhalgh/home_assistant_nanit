@@ -109,10 +109,18 @@ type fakeRelay struct {
 	cfg     RemoteRelayConfig
 	started atomic.Int32
 	stopped atomic.Int32
+	// stopBlock, if set, makes Stop block until it is closed (like a relay stuck in a dial).
+	stopBlock chan struct{}
 }
 
 func (r *fakeRelay) Start(ctx context.Context) error { r.started.Add(1); return nil }
-func (r *fakeRelay) Stop() error                     { r.stopped.Add(1); return nil }
+func (r *fakeRelay) Stop() error {
+	r.stopped.Add(1)
+	if r.stopBlock != nil {
+		<-r.stopBlock
+	}
+	return nil
+}
 
 // --- packet feeder ---
 
@@ -900,4 +908,60 @@ func TestHybridPool_StallCallbackFollowUp(t *testing.T) {
 	require.Equal(t, baby.StreamState_Alive, s)
 	require.Eventually(t, func() bool { s, _ := h.state(); return s == baby.StreamState_Unhealthy }, time.Second, 5*time.Millisecond,
 		"follow-up evaluation must notice local left the window")
+}
+
+// S1: STOPPED goes out before the tear-down, so a relay that is slow to stop
+// cannot delay it past the caller's bound.
+func TestHybridPool_StopLocalStream_SendsStoppedBeforeTearDown(t *testing.T) {
+	h := newHarness(t, longWatchdog)
+	release := make(chan struct{})
+	var once sync.Once
+	releaseRelay := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(releaseRelay)
+	h.relay.stopBlock = release
+	h.start()
+	require.Eventually(t, func() bool { return h.relay.started.Load() == 1 }, waitTimeout, 5*time.Millisecond, "relay started")
+
+	done := make(chan struct{})
+	go func() { _ = h.pool.StopLocalStream(context.Background()); close(done) }()
+
+	require.Eventually(t, func() bool { return h.relay.stopped.Load() == 1 }, waitTimeout, 5*time.Millisecond, "tear-down reached the relay")
+	require.Eventually(t, func() bool { return h.req.count(client.Streaming_STOPPED) == 1 }, time.Second, 5*time.Millisecond,
+		"STOPPED must be sent while the relay is still stopping")
+
+	releaseRelay()
+	stopWithin(t, func() { <-done })
+	assert.Equal(t, 1, h.req.count(client.Streaming_STOPPED), "exactly one STOPPED")
+	assert.Equal(t, int32(1), int32(h.relay.stopped.Load()), "the tear-down must run exactly once")
+}
+
+// S1: a cancelled ctx returns StopLocalStream although the tear-down is still
+// blocked; the tear-down finishes in the background.
+func TestHybridPool_StopLocalStream_ContextCutsBlockedTearDown(t *testing.T) {
+	h := newHarness(t, longWatchdog)
+	release := make(chan struct{})
+	var once sync.Once
+	releaseRelay := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(releaseRelay)
+	h.relay.stopBlock = release
+	h.start()
+	require.Eventually(t, func() bool { return h.relay.started.Load() == 1 }, waitTimeout, 5*time.Millisecond, "relay started")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	stopWithin(t, func() { _ = h.pool.StopLocalStream(ctx) })
+	assert.Less(t, int64(time.Since(start)), int64(time.Second), "ctx must bound StopLocalStream")
+	assert.Equal(t, 1, h.req.count(client.Streaming_STOPPED), "STOPPED sent")
+
+	releaseRelay()
+	select {
+	case <-h.pool.watchdogDone:
+	case <-time.After(waitTimeout):
+		t.Fatal("tear-down did not finish in the background")
+	}
+	require.Eventually(t, func() bool {
+		st, ty := h.state()
+		return ty == baby.StreamType_None && st == baby.StreamState_Unhealthy
+	}, waitTimeout, 5*time.Millisecond, "final state published after the background tear-down")
 }
