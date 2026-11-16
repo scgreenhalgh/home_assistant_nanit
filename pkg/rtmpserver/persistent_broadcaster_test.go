@@ -1,12 +1,16 @@
 package rtmpserver
 
 import (
+	"bytes"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/notedit/rtmp/av"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -118,12 +122,13 @@ func TestPersistentBroadcaster_HeaderPacketsStoredAndSentToNewSubscribers(t *tes
 	received := make([]string, 0)
 	timeout := time.After(200 * time.Millisecond)
 
+collectLoop:
 	for i := 0; i < 4; i++ {
 		select {
 		case pkt := <-sub.Packets():
 			received = append(received, string(pkt.Data))
 		case <-timeout:
-			break
+			break collectLoop
 		}
 	}
 
@@ -547,4 +552,89 @@ func TestPersistentBroadcaster_ConcurrentUnsubscribeAndClose(t *testing.T) {
 
 	wg.Wait()
 	// If we get here without panic, the test passes
+}
+
+// --- Lock Order Tests ---
+
+// Two sources broadcasting into a full subscriber buffer while headers arrive and
+// subscribers come and go must not deadlock (tsMu and mu must be taken in one order).
+func TestPersistentBroadcaster_NoDeadlockWithFullSubscriberAndHeaders(t *testing.T) {
+	oldLogger := log.Logger
+	log.Logger = zerolog.Nop()
+	defer func() { log.Logger = oldLogger }()
+
+	// No deferred Close: on a deadlock Close would block on mu and hide the failure
+	pb := NewPersistentBroadcaster("baby123")
+
+	// A subscriber that never reads, so its buffer fills and every packet is dropped
+	stuck := pb.Subscribe()
+	require.NotNil(t, stuck)
+
+	const iterations = 2000
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// Source A: media packets
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			pb.Broadcast(av.Packet{Type: 1, Time: time.Duration(i) * time.Millisecond}, 1)
+		}
+	}()
+
+	// Source B: header packets and media
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			pb.Broadcast(av.Packet{Type: 3, Data: []byte{byte(i)}}, 2)
+			pb.Broadcast(av.Packet{Type: 1, Time: time.Duration(i) * time.Millisecond}, 2)
+		}
+	}()
+
+	// Subscribe/Unsubscribe churn
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			if sub := pb.Subscribe(); sub != nil {
+				sub.Unsubscribe()
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		pb.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock: broadcaster workers did not finish within 10s")
+	}
+}
+
+// Dropped packets are all counted, but the warning is logged at most once per 10s.
+func TestPersistentBroadcaster_DroppedPacketWarningIsRateLimited(t *testing.T) {
+	oldLogger := log.Logger
+	var buf bytes.Buffer
+	log.Logger = zerolog.New(&buf)
+	defer func() { log.Logger = oldLogger }()
+
+	pb := NewPersistentBroadcaster("baby123")
+	defer pb.Close()
+
+	stuck := pb.Subscribe() // never read: buffer of 500 fills
+	require.NotNil(t, stuck)
+
+	const sent = 1500
+	for i := 0; i < sent; i++ {
+		pb.Broadcast(av.Packet{Type: 1, Time: time.Duration(i) * time.Millisecond}, 1)
+	}
+
+	assert.Equal(t, int64(sent-500), pb.droppedPackets.Load())
+	out := buf.String()
+	assert.Equal(t, 1, strings.Count(out, "Packet(s) dropped due to full subscriber buffer"))
+	assert.Contains(t, out, `"dropped_since_last_log":1`)
 }
