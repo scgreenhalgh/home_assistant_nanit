@@ -448,7 +448,9 @@ func (s *rtmpHandler) registerLocalPublisher(babyUID, slotSuffix, streamKey stri
 	s.localPublishers[babyUID]++
 	count := s.localPublishers[babyUID]
 	// Also track by streamKey for pool-aware lookups
-	s.localPublishers[streamKey]++
+	if streamKey != babyUID {
+		s.localPublishers[streamKey]++
+	}
 	s.localPublishersMu.Unlock()
 
 	log.Info().Str("baby_uid", babyUID).Str("stream_key", streamKey).Int("active_count", count).Msg("Local publisher registered")
@@ -474,9 +476,11 @@ func (s *rtmpHandler) unregisterLocalPublisher(babyUID, streamKey string) int {
 		remaining = 0
 	}
 	// Also decrement streamKey count
-	s.localPublishers[streamKey]--
-	if s.localPublishers[streamKey] <= 0 {
-		delete(s.localPublishers, streamKey)
+	if streamKey != babyUID {
+		s.localPublishers[streamKey]--
+		if s.localPublishers[streamKey] <= 0 {
+			delete(s.localPublishers, streamKey)
+		}
 	}
 	s.localPublishersMu.Unlock()
 
