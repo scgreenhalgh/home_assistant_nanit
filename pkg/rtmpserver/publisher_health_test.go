@@ -94,3 +94,73 @@ func TestLocalPublisherLeaving_PublishesUnhealthyOnlyWhenLast(t *testing.T) {
 		"the last publisher leaving must publish Unhealthy")
 }
 
+func TestSourceAge(t *testing.T) {
+	pb := NewPersistentBroadcaster("baby123")
+	pb.SetActiveSource(1)
+
+	_, seen := pb.SourceAge(21)
+	assert.False(t, seen, "no packet yet")
+
+	// Header packets are not media and do not count.
+	pb.Broadcast(av.Packet{Type: av.H264DecoderConfig}, 21)
+	_, seen = pb.SourceAge(21)
+	assert.False(t, seen, "header packets do not count")
+
+	// A media packet from a filtered (inactive) source still counts.
+	pb.Broadcast(av.Packet{Type: av.H264, IsKeyFrame: true}, 21)
+	age, seen := pb.SourceAge(21)
+	assert.True(t, seen)
+	assert.Less(t, int64(age), int64(time.Second))
+
+	time.Sleep(30 * time.Millisecond)
+	age, _ = pb.SourceAge(21)
+	assert.GreaterOrEqual(t, int64(age), int64(30*time.Millisecond))
+	_, seen = pb.SourceAge(1)
+	assert.False(t, seen, "sources are tracked separately")
+}
+
+// Requesting the current active source cancels a pending switch to another source.
+func TestRequestSourceSwitch_ToActiveCancelsPending(t *testing.T) {
+	pb := NewPersistentBroadcaster("baby123")
+	pb.SetActiveSource(1)
+	pb.RequestSourceSwitch(21)
+	require.True(t, pb.IsPendingSwitch())
+	assert.Equal(t, 21, pb.PendingSourceID())
+
+	pb.RequestSourceSwitch(1)
+	assert.False(t, pb.IsPendingSwitch())
+	assert.Equal(t, 0, pb.PendingSourceID())
+
+	// A later keyframe from 21 must not switch.
+	pb.Broadcast(av.Packet{Type: av.H264, IsKeyFrame: true}, 21)
+	assert.Equal(t, 1, pb.ActiveSourceID())
+}
+
+// A stale owner clearing its stall config must not remove a newer owner's.
+func TestClearStallConfig_OnlyClearsOwnConfig(t *testing.T) {
+	pb := NewPersistentBroadcaster("baby123")
+	old := &StallConfig{Threshold: time.Hour, Callback: func(int) {}}
+	pb.SetStallConfig(old)
+	newer := &StallConfig{Threshold: time.Hour, Callback: func(int) {}}
+	pb.SetStallConfig(newer)
+
+	pb.ClearStallConfig(old)
+	pb.tsMu.Lock()
+	assert.Same(t, newer, pb.stallConfig)
+	pb.tsMu.Unlock()
+
+	pb.ClearStallConfig(newer)
+	pb.tsMu.Lock()
+	assert.Nil(t, pb.stallConfig)
+	pb.tsMu.Unlock()
+	pb.Close()
+}
+
+// Health means video: audio-only packets do not make a source seen.
+func TestSourceAge_IgnoresAudio(t *testing.T) {
+	pb := NewPersistentBroadcaster("baby123")
+	pb.Broadcast(av.Packet{Type: av.AAC}, 21)
+	pb.Broadcast(av.Packet{Type: av.OPUS}, 21)
+	_, seen := pb.SourceAge(21)
+	assert.False(t, seen, "audio packets must not count as a healthy source")
+}
