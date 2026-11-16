@@ -51,7 +51,8 @@ type rtmpHandler struct {
 
 	// Track active local publishers count to detect reconnections vs drops
 	localPublishersMu sync.RWMutex
-	localPublishers   map[string]int // count of active publishers per baby
+	localPublishers   map[string]int       // count of active publishers per baby
+	lastLocalConnect  map[string]time.Time // when a local publisher last connected, per baby
 }
 
 // StartRTMPServer - Blocking server (legacy, starts in background and returns RTMPServer for access)
@@ -266,6 +267,14 @@ func (srv *RTMPServer) WaitForPublisher(babyUID string, timeout time.Duration) e
 	}
 }
 
+// LocalPublisherConnectedAt returns when a local publisher last connected for
+// the baby, or the zero time if none has.
+func (srv *RTMPServer) LocalPublisherConnectedAt(babyUID string) time.Time {
+	srv.handler.localPublishersMu.RLock()
+	defer srv.handler.localPublishersMu.RUnlock()
+	return srv.handler.lastLocalConnect[babyUID]
+}
+
 // ErrPublisherTimeout is returned when waiting for publisher times out
 var ErrPublisherTimeout = net.UnknownNetworkError("publisher connection timeout")
 
@@ -331,6 +340,7 @@ func newRtmpHandler(babyStateManager *baby.StateManager) *rtmpHandler {
 		babyStateManager:  babyStateManager,
 		publisherWaitCh:   make(map[string]chan struct{}),
 		localPublishers:   make(map[string]int),
+		lastLocalConnect:  make(map[string]time.Time),
 	}
 }
 
@@ -447,6 +457,7 @@ func (s *rtmpHandler) registerLocalPublisher(babyUID, slotSuffix, streamKey stri
 	s.localPublishersMu.Lock()
 	s.localPublishers[babyUID]++
 	count := s.localPublishers[babyUID]
+	s.lastLocalConnect[babyUID] = time.Now()
 	// Also track by streamKey for pool-aware lookups
 	if streamKey != babyUID {
 		s.localPublishers[streamKey]++

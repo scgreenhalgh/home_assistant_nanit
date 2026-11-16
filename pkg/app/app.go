@@ -148,8 +148,12 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 		// Websocket connection
 		ws := client.NewWebsocketConnectionManager(baby.UID, baby.CameraUID, app.SessionStore.Session, app.RestClient, app.BabyStateManager)
 
+		// One pacer per baby, shared by the pool of every websocket connection,
+		// so a reconnect does not reset the STARTED rate limit and backoff
+		pacer := stream.NewRequestPacer(stream.RequestPacerConfig{})
+
 		ws.WithReadyConnection(func(conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
-			app.runWebsocket(baby.UID, conn, childCtx)
+			app.runWebsocket(baby.UID, conn, pacer, childCtx)
 		})
 
 		if app.Opts.EventPolling.Enabled {
@@ -192,7 +196,7 @@ func (app *App) pollMessages(ctx utils.GracefulContext, babyUID string, babyStat
 	}
 }
 
-func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
+func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, pacer *stream.RequestPacer, childCtx utils.GracefulContext) {
 	// Reading sensor data
 	conn.RegisterMessageHandler(func(m *client.Message, conn *client.WebsocketConnection) {
 		// Sensor request initiated by us on start (or some other client, we don't care)
@@ -258,7 +262,7 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 
 	// Streaming (local with remote failover)
 	if app.Opts.RTMP != nil {
-		pool := app.createHybridPool(babyUID, conn)
+		pool := app.createHybridPool(babyUID, conn, pacer)
 
 		// Convert GracefulContext to standard context
 		ctx, cancel := context.WithCancel(context.Background())
@@ -285,7 +289,7 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 
 // createHybridPool creates the stream pool for the given baby: local as primary,
 // remote as hot standby (different network paths). It owns StreamType and StreamState.
-func (app *App) createHybridPool(babyUID string, conn *client.WebsocketConnection) *stream.HybridStreamPool {
+func (app *App) createHybridPool(babyUID string, conn *client.WebsocketConnection, pacer *stream.RequestPacer) *stream.HybridStreamPool {
 	return stream.NewHybridStreamPool(stream.HybridStreamPoolConfig{
 		BabyUID:        babyUID,
 		LocalURL:       app.getLocalStreamURL(babyUID), // e.g., rtmp://host/local/babyUID
@@ -296,6 +300,7 @@ func (app *App) createHybridPool(babyUID string, conn *client.WebsocketConnectio
 		RTMPServer:     app.rtmpServer,
 		StallThreshold: 3 * time.Second, // Re-evaluate if no packets for 3s
 		OnAuthFailed:   app.onAuthFailed,
+		Pacer:          pacer,
 	})
 }
 

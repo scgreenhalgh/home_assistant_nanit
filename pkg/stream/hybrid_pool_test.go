@@ -3,12 +3,14 @@ package stream
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/notedit/rtmp/av"
+	"github.com/notedit/rtmp/format/rtmp"
 	"github.com/scgreenhalgh/home_assistant_nanit/pkg/baby"
 	"github.com/scgreenhalgh/home_assistant_nanit/pkg/client"
 	"github.com/scgreenhalgh/home_assistant_nanit/pkg/rtmpserver"
@@ -552,6 +554,31 @@ func TestHybridPool_FlappingLocal_BackoffGrows(t *testing.T) {
 		"backoff must reset after StableWindow of healthy local")
 }
 
+// F3: pacing survives a new pool when the pacer is shared.
+func TestHybridPool_SharedPacer_NoRequestBurstOnReconnect(t *testing.T) {
+	pacing := func(c *HybridStreamPoolConfig) {
+		c.MinRetryInterval = 300 * time.Millisecond
+		c.InitialBackoff = 300 * time.Millisecond
+	}
+	cfg := testConfig()
+	pacing(&cfg)
+	pacer := NewRequestPacer(RequestPacerConfig{MinInterval: cfg.MinRetryInterval, InitialBackoff: cfg.InitialBackoff, MaxBackoff: cfg.MaxBackoff, StableWindow: time.Minute})
+	withPacer := func(c *HybridStreamPoolConfig) { pacing(c); c.Pacer = pacer }
+
+	h := newHarness(t, withPacer)
+	h.start()
+	h.waitStarted(1, "pool A requests local")
+	stopWithin(t, h.pool.Close)
+	sentAt := h.req.all()[0].At
+
+	h.pool = h.newPool(withPacer)
+	h.start()
+	time.Sleep(150 * time.Millisecond)
+	assert.Equal(t, 1, h.req.count(client.Streaming_STARTED), "pool B must not send before the interval has passed")
+	h.waitStarted(2, "pool B requests after the interval")
+	assert.GreaterOrEqual(t, int64(h.req.all()[1].At.Sub(sentAt)), int64(cfg.MinRetryInterval-10*time.Millisecond))
+}
+
 // F4: a blocking SendRequest does not stall evaluate or Close, and the
 // in-flight request does nothing once the pool is closed.
 func TestHybridPool_BlockingSend_DoesNotStallEvaluateOrClose(t *testing.T) {
@@ -677,6 +704,38 @@ func TestHybridPool_NoStartedAfterClose(t *testing.T) {
 	h.pool.sendMu.Unlock()
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, 0, h.req.count(client.Streaming_STARTED), "no STARTED may be sent once the pool is closed")
+}
+
+// G3: no STARTED within the grace period after a local publisher connected.
+func TestHybridPool_NoRequestWhilePublisherConnecting(t *testing.T) {
+	const grace = 400 * time.Millisecond
+	h := newHarness(t, func(c *HybridStreamPoolConfig) { c.PublisherGrace = grace; c.WatchdogInterval = time.Hour })
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := lis.Addr().String()
+	lis.Close()
+	go h.srv.Run(addr)
+	t.Cleanup(func() { h.srv.Close() })
+	var nc net.Conn
+	require.Eventually(t, func() bool {
+		var err error
+		_, nc, err = rtmp.NewClient().Dial("rtmp://"+addr+"/local/"+testBabyUID, rtmp.PrepareWriting)
+		return err == nil
+	}, waitTimeout, 20*time.Millisecond)
+	t.Cleanup(func() { nc.Close() })
+	require.Eventually(t, func() bool { s, _ := h.state(); return s == baby.StreamState_Alive }, waitTimeout, 5*time.Millisecond, "handler saw the publisher")
+	connected := h.srv.LocalPublisherConnectedAt(testBabyUID)
+	require.False(t, connected.IsZero())
+
+	h.start() // publisher connected, no video yet
+	time.Sleep(grace - time.Since(connected) - 100*time.Millisecond)
+	assert.Equal(t, 0, len(h.req.all()), "no STARTED while the publisher is still connecting")
+
+	h.waitStarted(1, "a STARTED follows once the grace has passed without video")
+	assert.GreaterOrEqual(t, int64(h.req.all()[0].At.Sub(connected)), int64(grace))
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, 1, len(h.req.all()))
 }
 
 // G6: a closed pool does not evaluate.

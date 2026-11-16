@@ -27,6 +27,7 @@ const (
 	defaultWatchdogInterval = 1 * time.Second  // How often to evaluate stream health
 	defaultRequestTimeout   = 30 * time.Second // How long to wait for the reply to STARTED
 	defaultPublisherWait    = 15 * time.Second // How long to wait for local packets after STARTED is acknowledged
+	defaultPublisherGrace   = 10 * time.Second // No STARTED this long after a local publisher connected
 )
 
 // StreamRequester sends a request over the camera websocket.
@@ -60,7 +61,8 @@ type HybridStreamPool struct {
 	watchdogDone chan struct{}
 
 	pacer              *RequestPacer
-	localRequestActive bool // one request in flight at a time
+	localRequestActive bool      // one request in flight at a time
+	graceFollowUpFor   time.Time // publisher connect time a follow-up evaluation is scheduled for
 }
 
 // HybridStreamPoolConfig configuration for HybridStreamPool.
@@ -80,12 +82,18 @@ type HybridStreamPoolConfig struct {
 	// with a real RTMP client.
 	NewRelay func(RemoteRelayConfig) RemoteRelay
 
+	// Pacer rate-limits STARTED requests. Optional: share one across the pools
+	// of a baby so pacing survives websocket reconnects. If nil, the pool makes
+	// its own from MinRetryInterval, InitialBackoff, MaxBackoff and StableWindow.
+	Pacer *RequestPacer
+
 	HealthWindow     time.Duration
 	WatchdogInterval time.Duration
 	MinRetryInterval time.Duration
 	InitialBackoff   time.Duration
 	MaxBackoff       time.Duration
 	StableWindow     time.Duration
+	PublisherGrace   time.Duration
 	RequestTimeout   time.Duration
 	PublisherWait    time.Duration
 }
@@ -102,6 +110,7 @@ func NewHybridStreamPool(config HybridStreamPoolConfig) *HybridStreamPool {
 	setDefault(&config.WatchdogInterval, defaultWatchdogInterval)
 	setDefault(&config.RequestTimeout, defaultRequestTimeout)
 	setDefault(&config.PublisherWait, defaultPublisherWait)
+	setDefault(&config.PublisherGrace, defaultPublisherGrace)
 	if config.NewRelay == nil {
 		config.NewRelay = func(c RemoteRelayConfig) RemoteRelay {
 			c.RTMPClient = NewRealRTMPClient()
@@ -109,12 +118,15 @@ func NewHybridStreamPool(config HybridStreamPoolConfig) *HybridStreamPool {
 		}
 	}
 
-	pacer := NewRequestPacer(RequestPacerConfig{
-		MinInterval:    config.MinRetryInterval,
-		InitialBackoff: config.InitialBackoff,
-		MaxBackoff:     config.MaxBackoff,
-		StableWindow:   config.StableWindow,
-	})
+	pacer := config.Pacer
+	if pacer == nil {
+		pacer = NewRequestPacer(RequestPacerConfig{
+			MinInterval:    config.MinRetryInterval,
+			InitialBackoff: config.InitialBackoff,
+			MaxBackoff:     config.MaxBackoff,
+			StableWindow:   config.StableWindow,
+		})
+	}
 
 	return &HybridStreamPool{
 		cfg:          config,
@@ -313,6 +325,17 @@ func (p *HybridStreamPool) tryRequestLocalStream() {
 
 	if p.closed || p.localRequestActive {
 		return
+	}
+	// A publisher that just connected is about to send video: a STARTED now
+	// could open a second push. Evaluate again when the grace ends.
+	if at := p.cfg.RTMPServer.LocalPublisherConnectedAt(p.cfg.BabyUID); !at.IsZero() {
+		if remaining := p.cfg.PublisherGrace - time.Since(at); remaining > 0 {
+			if !p.graceFollowUpFor.Equal(at) {
+				p.graceFollowUpFor = at
+				time.AfterFunc(remaining, p.evaluate)
+			}
+			return
+		}
 	}
 	if !p.pacer.TryAcquire() {
 		return
