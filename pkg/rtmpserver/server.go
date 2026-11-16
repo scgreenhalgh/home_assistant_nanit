@@ -52,6 +52,10 @@ type rtmpHandler struct {
 	// Track active local publishers count to detect reconnections vs drops
 	localPublishersMu sync.RWMutex
 	localPublishers   map[string]int // count of active publishers per baby
+
+	// Current (newest) publisher connection per stream key
+	currentPublishersMu sync.Mutex
+	currentPublishers   map[string]net.Conn
 }
 
 // StartRTMPServer - Blocking server (legacy, starts in background and returns RTMPServer for access)
@@ -331,6 +335,7 @@ func newRtmpHandler(babyStateManager *baby.StateManager) *rtmpHandler {
 		babyStateManager:  babyStateManager,
 		publisherWaitCh:   make(map[string]chan struct{}),
 		localPublishers:   make(map[string]int),
+		currentPublishers: make(map[string]net.Conn),
 	}
 }
 
@@ -362,7 +367,16 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 
 	if c.Publishing {
 		sublog.Info().Msg("New local stream publisher connected")
+		// Newest publisher wins: claim the stream key first, so packets from an
+		// older connection (a second push from the camera, or a half-open old
+		// TCP connection) are dropped from now on
+		old := s.claimPublisher(streamKey, nc)
 		broadcastFunc := s.registerLocalPublisher(babyUID, slotSuffix, streamKey)
+		if old != nil {
+			// Closed after registering, so the old read loop sees a replacement
+			sublog.Warn().Stringer("old_client_addr", old.RemoteAddr()).Msg("Replacing older publisher on the same stream key")
+			old.Close()
+		}
 
 		// Signal any waiters that publisher connected
 		// Check both streamKey-specific and babyUID-general waiters
@@ -382,6 +396,7 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 		for {
 			pkt, err := c.ReadPacket()
 			if err != nil {
+				s.releasePublisher(streamKey, nc)
 				// Unregister and check if other publishers remain
 				remaining := s.unregisterLocalPublisher(babyUID, streamKey)
 
@@ -396,7 +411,8 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 				return
 			}
 
-			broadcastFunc(pkt)
+			// A replaced connection can still return buffered packets; they are dropped
+			s.forwardIfCurrent(streamKey, nc, pkt, broadcastFunc)
 		}
 
 	} else {
@@ -482,6 +498,44 @@ func (s *rtmpHandler) unregisterLocalPublisher(babyUID, streamKey string) int {
 
 	log.Info().Str("baby_uid", babyUID).Str("stream_key", streamKey).Int("remaining_count", remaining).Msg("Local publisher unregistered")
 	return remaining
+}
+
+// claimPublisher makes nc the current publisher for streamKey and returns the
+// previous one, or nil
+func (s *rtmpHandler) claimPublisher(streamKey string, nc net.Conn) net.Conn {
+	s.currentPublishersMu.Lock()
+	defer s.currentPublishersMu.Unlock()
+	old := s.currentPublishers[streamKey]
+	s.currentPublishers[streamKey] = nc
+	return old
+}
+
+// isCurrentPublisher returns whether nc is the current publisher for streamKey
+func (s *rtmpHandler) isCurrentPublisher(streamKey string, nc net.Conn) bool {
+	s.currentPublishersMu.Lock()
+	defer s.currentPublishersMu.Unlock()
+	return s.currentPublishers[streamKey] == nc
+}
+
+// forwardIfCurrent broadcasts pkt if nc is still the current publisher for
+// streamKey, and reports whether it did. The check and the broadcast are not
+// atomic: one packet can still pass if a new publisher claims in between.
+func (s *rtmpHandler) forwardIfCurrent(streamKey string, nc net.Conn, pkt av.Packet, broadcast func(av.Packet)) bool {
+	if !s.isCurrentPublisher(streamKey, nc) {
+		return false
+	}
+	broadcast(pkt)
+	return true
+}
+
+// releasePublisher forgets nc as the current publisher for streamKey, unless a
+// newer publisher has already replaced it
+func (s *rtmpHandler) releasePublisher(streamKey string, nc net.Conn) {
+	s.currentPublishersMu.Lock()
+	defer s.currentPublishersMu.Unlock()
+	if s.currentPublishers[streamKey] == nc {
+		delete(s.currentPublishers, streamKey)
+	}
 }
 
 // getNewSubscriber creates a subscription to the PersistentBroadcaster
