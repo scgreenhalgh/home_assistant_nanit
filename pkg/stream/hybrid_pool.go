@@ -28,6 +28,7 @@ const (
 	defaultRequestTimeout   = 30 * time.Second // How long to wait for the reply to STARTED
 	defaultPublisherWait    = 15 * time.Second // How long to wait for local packets after STARTED is acknowledged
 	defaultPublisherGrace   = 10 * time.Second // No STARTED this long after a local publisher connected
+	defaultStopTimeout      = 3 * time.Second  // How long to wait for the reply to STOPPED
 )
 
 // StreamRequester sends a request over the camera websocket.
@@ -48,7 +49,7 @@ type HybridStreamPool struct {
 	cfg HybridStreamPoolConfig
 
 	evalMu sync.Mutex // serialises evaluate
-	sendMu sync.Mutex // serialises request sends
+	sendMu sync.Mutex // orders STARTED and STOPPED sends
 
 	mu           sync.Mutex
 	started      bool
@@ -96,6 +97,7 @@ type HybridStreamPoolConfig struct {
 	PublisherGrace   time.Duration
 	RequestTimeout   time.Duration
 	PublisherWait    time.Duration
+	StopTimeout      time.Duration
 }
 
 // NewHybridStreamPool creates a new hybrid stream pool
@@ -111,6 +113,7 @@ func NewHybridStreamPool(config HybridStreamPoolConfig) *HybridStreamPool {
 	setDefault(&config.RequestTimeout, defaultRequestTimeout)
 	setDefault(&config.PublisherWait, defaultPublisherWait)
 	setDefault(&config.PublisherGrace, defaultPublisherGrace)
+	setDefault(&config.StopTimeout, defaultStopTimeout)
 	if config.NewRelay == nil {
 		config.NewRelay = func(c RemoteRelayConfig) RemoteRelay {
 			c.RTMPClient = NewRealRTMPClient()
@@ -358,6 +361,8 @@ func (p *HybridStreamPool) requestLocalStream(ctx context.Context) {
 		}
 	}()
 
+	// sendMu orders this send against StopLocalStream's STOPPED, which marks
+	// the pool closed before taking it: no STARTED can follow the STOPPED.
 	p.sendMu.Lock()
 	p.mu.Lock()
 	closed := p.closed
@@ -429,7 +434,7 @@ func (p *HybridStreamPool) runHealthWatchdog(ctx context.Context) {
 // then puts the filter on local so the camera's packets pass while no pool
 // exists, and publishes the final state. It reports whether this call stopped
 // a running pool. An in-flight STARTED is not waited for.
-func (p *HybridStreamPool) shutdown() bool {
+func (p *HybridStreamPool) shutdown(stopping bool) bool {
 	p.mu.Lock()
 	wasRunning := p.started && !p.closed
 	p.closed = true
@@ -458,6 +463,8 @@ func (p *HybridStreamPool) shutdown() bool {
 	defer p.evalMu.Unlock()
 	p.pointFilter(b, HybridSourceLocal, true)
 	switch {
+	case stopping:
+		p.publish(baby.StreamType_None, baby.StreamState_Unhealthy)
 	case p.sourceHealthy(b, HybridSourceLocal):
 		p.publish(baby.StreamType_Local, baby.StreamState_Alive)
 	default:
@@ -469,7 +476,44 @@ func (p *HybridStreamPool) shutdown() bool {
 // Close stops the pool without telling the camera. Use it when the websocket is
 // gone or is being replaced: STOPPED would end a camera push the next pool keeps.
 func (p *HybridStreamPool) Close() {
-	if p.shutdown() {
+	if p.shutdown(false) {
 		log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Hybrid stream pool closed")
 	}
+}
+
+// StopLocalStream stops the pool and tells the camera to stop pushing to our URL,
+// waiting for the reply up to StopTimeout or until ctx is cancelled. It is idempotent.
+func (p *HybridStreamPool) StopLocalStream(ctx context.Context) error {
+	if !p.shutdown(true) {
+		return nil
+	}
+
+	// The pool is closed now; waiting for sendMu lets a STARTED already being
+	// sent go out first, so STOPPED is the last word.
+	p.sendMu.Lock()
+	awaitResponse := p.cfg.Conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
+		Streaming: &client.Streaming{
+			Id:       client.StreamIdentifier(client.StreamIdentifier_MOBILE).Enum(),
+			RtmpUrl:  utils.ConstRefStr(p.cfg.LocalURL),
+			Status:   client.Streaming_Status(client.Streaming_STOPPED).Enum(),
+			Attempts: utils.ConstRefInt32(1),
+		},
+	})
+	p.sendMu.Unlock()
+	replied := make(chan error, 1)
+	go func() {
+		_, err := awaitResponse(p.cfg.StopTimeout)
+		replied <- err
+	}()
+	select {
+	case err := <-replied:
+		if err != nil {
+			log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("No confirmation for local stream stop")
+		}
+	case <-ctx.Done():
+		log.Warn().Str("baby_uid", p.cfg.BabyUID).Msg("Stopped waiting for local stream stop confirmation")
+	}
+
+	log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Hybrid stream pool stopped")
+	return nil
 }

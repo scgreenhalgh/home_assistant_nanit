@@ -39,12 +39,24 @@ type fakeRequester struct {
 	mu       sync.Mutex
 	requests []recordedRequest
 	// reply decides the answer for a request; nil means "200 OK at once".
-	reply func(r recordedRequest) (time.Duration, error)
+	reply       func(r recordedRequest) (time.Duration, error)
+	stopReplied atomic.Bool
 	// block, if set, makes SendRequest itself block until it is closed.
 	block chan struct{}
+	// holdStarted, if set, pauses a STARTED inside SendRequest before it is
+	// recorded; inSend is signalled when that happens.
+	holdStarted chan struct{}
+	inSend      chan struct{}
 }
 
 func (f *fakeRequester) SendRequest(t client.RequestType, req *client.Request) func(time.Duration) (*client.Response, error) {
+	f.mu.Lock()
+	hold, inSend := f.holdStarted, f.inSend
+	f.mu.Unlock()
+	if hold != nil && req.GetStreaming().GetStatus() == client.Streaming_STARTED {
+		inSend <- struct{}{}
+		<-hold
+	}
 	r := recordedRequest{Type: t, Status: req.GetStreaming().GetStatus(), URL: req.GetStreaming().GetRtmpUrl(), At: time.Now()}
 	f.mu.Lock()
 	f.requests = append(f.requests, r)
@@ -66,6 +78,9 @@ func (f *fakeRequester) SendRequest(t client.RequestType, req *client.Request) f
 			return nil, errors.New("Request timeout")
 		}
 		time.Sleep(delay)
+		if r.Status == client.Streaming_STOPPED {
+			f.stopReplied.Store(true)
+		}
 		return &client.Response{}, err
 	}
 }
@@ -208,6 +223,7 @@ func testConfig() HybridStreamPoolConfig {
 		MaxBackoff:       200 * time.Millisecond,
 		RequestTimeout:   200 * time.Millisecond,
 		PublisherWait:    150 * time.Millisecond,
+		StopTimeout:      500 * time.Millisecond,
 	}
 }
 
@@ -427,6 +443,36 @@ func TestHybridPool_FailoverToRemoteAndBack(t *testing.T) {
 	require.Eventually(t, func() bool { return h.b.ActiveSourceID() == HybridSourceLocal && !h.b.IsPendingSwitch() }, waitTimeout, 5*time.Millisecond)
 }
 
+// T6: StopLocalStream sends exactly one STOPPED naming the pool URL, waits for
+// the reply, and is idempotent; Close sends nothing. Both stop the relay and
+// watchdog, and later ticks send nothing.
+func TestHybridPool_StopLocalStream(t *testing.T) {
+	h := newHarness(t, nil)
+	h.req.reply = func(r recordedRequest) (time.Duration, error) {
+		if r.Status == client.Streaming_STOPPED {
+			return 100 * time.Millisecond, nil
+		}
+		return 0, nil
+	}
+	h.local.start()
+	time.Sleep(30 * time.Millisecond)
+	h.start()
+	require.Eventually(t, func() bool { return h.relay.started.Load() == 1 }, waitTimeout, 5*time.Millisecond, "relay started")
+	time.Sleep(50 * time.Millisecond)
+
+	stopWithin(t, func() { _ = h.pool.StopLocalStream(context.Background()) })
+	assert.True(t, h.req.stopReplied.Load(), "StopLocalStream must wait for the STOPPED reply")
+	stopWithin(t, func() { _ = h.pool.StopLocalStream(context.Background()) })
+
+	assert.Equal(t, 1, h.req.count(client.Streaming_STOPPED), "exactly one STOPPED")
+	for _, r := range h.req.all() {
+		if r.Status == client.Streaming_STOPPED {
+			assert.Equal(t, testLocalURL, r.URL)
+		}
+	}
+	assertStopped(t, h)
+}
+
 func TestHybridPool_Close(t *testing.T) {
 	h := newHarness(t, nil)
 	h.local.start()
@@ -516,6 +562,21 @@ func TestHybridPool_CloseOnRemote_FilterBackToLocal(t *testing.T) {
 
 	h.local.start()
 	h.waitPackets(c, true, "local packets must reach the subscriber after Close")
+}
+
+// F1: StopLocalStream while on remote also restores the filter and publishes None/Unhealthy.
+func TestHybridPool_StopOnRemote_FilterBackToLocal(t *testing.T) {
+	h := newHarness(t, nil)
+	h.goToRemote()
+
+	h.remote.halt()
+	stopWithin(t, func() { _ = h.pool.StopLocalStream(context.Background()) })
+
+	assert.Equal(t, HybridSourceLocal, h.b.ActiveSourceID(), "filter must be on local after StopLocalStream")
+	assert.False(t, h.b.IsPendingSwitch())
+	st, ty := h.state()
+	assert.Equal(t, baby.StreamType_None, ty)
+	assert.Equal(t, baby.StreamState_Unhealthy, st)
 }
 
 // F2: a flapping local stream does not reset the backoff; only a stable local
@@ -692,6 +753,23 @@ func TestHybridPool_SwitchToRemoteWaitsForKeyframe(t *testing.T) {
 	assert.True(t, c.firstRemoteKF.Load(), "first remote packet a subscriber gets must be a keyframe")
 }
 
+// F8: StopLocalStream stops waiting for the STOPPED reply when ctx is cancelled.
+func TestHybridPool_StopLocalStream_ContextCutsWait(t *testing.T) {
+	h := newHarness(t, func(c *HybridStreamPoolConfig) { c.StopTimeout = 5 * time.Second })
+	h.req.reply = func(r recordedRequest) (time.Duration, error) {
+		if r.Status == client.Streaming_STOPPED {
+			return 2 * time.Second, nil
+		}
+		return 0, nil
+	}
+	h.start()
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	start := time.Now()
+	stopWithin(t, func() { _ = h.pool.StopLocalStream(ctx) })
+	assert.Less(t, int64(time.Since(start)), int64(time.Second), "cancelled ctx must cut the STOPPED wait short")
+}
+
 // --- second review ---
 
 // G2: a STARTED whose send is reached after the pool closed is not sent.
@@ -704,6 +782,55 @@ func TestHybridPool_NoStartedAfterClose(t *testing.T) {
 	h.pool.sendMu.Unlock()
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, 0, h.req.count(client.Streaming_STARTED), "no STARTED may be sent once the pool is closed")
+}
+
+// G2: StopLocalStream racing a pending STARTED never sends STARTED after STOPPED.
+func TestHybridPool_NoStartedAfterStopped(t *testing.T) {
+	assertOrder := func(t *testing.T, h *harness) {
+		t.Helper()
+		stopped := false
+		for _, r := range h.req.all() {
+			if r.Status == client.Streaming_STOPPED {
+				stopped = true
+			} else if stopped && r.Status == client.Streaming_STARTED {
+				t.Fatal("STARTED recorded after STOPPED")
+			}
+		}
+		assert.True(t, stopped, "STOPPED was sent")
+	}
+
+	t.Run("send not yet reached", func(t *testing.T) {
+		h := newHarness(t, longWatchdog)
+		h.pool.sendMu.Lock()
+		h.start()
+		time.Sleep(50 * time.Millisecond)
+		done := make(chan struct{})
+		go func() { _ = h.pool.StopLocalStream(context.Background()); close(done) }()
+		time.Sleep(50 * time.Millisecond)
+		h.pool.sendMu.Unlock()
+		<-done
+		time.Sleep(50 * time.Millisecond)
+		assertOrder(t, h)
+	})
+
+	t.Run("paused inside send", func(t *testing.T) {
+		h := newHarness(t, longWatchdog)
+		hold := make(chan struct{})
+		h.req.holdStarted, h.req.inSend = hold, make(chan struct{}, 1)
+		h.start()
+		select {
+		case <-h.req.inSend:
+		case <-time.After(waitTimeout):
+			t.Fatal("STARTED send not reached")
+		}
+		done := make(chan struct{})
+		go func() { _ = h.pool.StopLocalStream(context.Background()); close(done) }()
+		time.Sleep(50 * time.Millisecond)
+		assert.Equal(t, 0, h.req.count(client.Streaming_STOPPED), "STOPPED must wait for the STARTED send")
+		close(hold)
+		stopWithin(t, func() { <-done })
+		assertOrder(t, h)
+	})
 }
 
 // G3: no STARTED within the grace period after a local publisher connected.
