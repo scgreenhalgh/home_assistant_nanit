@@ -55,7 +55,11 @@ func newGracefulRunner(ctx *gracefulCtx) *gracefulRunner {
 
 func (runner *gracefulRunner) Wait() (bool, error) {
 	runner.ctx.wg.Wait()
-	return runner.ctx.err == errCancel, runner.ctx.err
+	// Fail can still run after the handler returned (the parent cancelling a finished child)
+	runner.ctx.mutex.Lock()
+	err := runner.ctx.err
+	runner.ctx.mutex.Unlock()
+	return err == errCancel, err
 }
 
 func (runner *gracefulRunner) Cancel() {
