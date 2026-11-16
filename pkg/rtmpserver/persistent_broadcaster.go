@@ -1,6 +1,7 @@
 package rtmpserver
 
 import (
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,61 @@ const dropLogInterval = 10 * time.Second
 // dropLogEpoch is the base for the warning rate limit. time.Since uses the
 // monotonic clock, so a wall-clock step cannot suppress the warning.
 var dropLogEpoch = time.Now()
+
+// sessionRestartThreshold is how far a track's timestamp may jump before it
+// is treated as a new session (reconnect) and rebased. Without a new video
+// config only a backward jump counts; after one, a forward jump counts too.
+const sessionRestartThreshold = time.Second
+
+// keyframeGateTimeout is the longest the video gate waits for a keyframe
+// before it opens anyway. A variable so tests can shorten it.
+var keyframeGateTimeout = 10 * time.Second
+
+// sourceState is what the broadcaster keeps per source ID (guarded by tsMu).
+type sourceState struct {
+	// headers holds one header per headerKey, in order of first arrival.
+	// Stored for every source, also one that is not forwarded (hot standby).
+	headers []av.Packet
+
+	// Previous incoming timestamp per track (0 = video, 1 = audio) of the
+	// forwarded packets of this source
+	lastIn [2]time.Duration
+	haveIn [2]bool
+
+	// maybeNewSession is set when a video config arrives after media; the
+	// next media packet decides whether a new session started
+	maybeNewSession bool
+}
+
+// headerKey is the storage key of a header: its type. H264SPSPPSNALU carries a
+// single NALU, so it is keyed by NALU type to keep an SPS and a PPS apart.
+func headerKey(pkt av.Packet) int {
+	if pkt.Type == av.H264SPSPPSNALU && len(pkt.Data) > 0 {
+		return pkt.Type<<8 | int(pkt.Data[0]&0x1f)
+	}
+	return pkt.Type
+}
+
+func (st *sourceState) header(key int) (av.Packet, bool) {
+	for _, h := range st.headers {
+		if headerKey(h) == key {
+			return h, true
+		}
+	}
+	return av.Packet{}, false
+}
+
+// storeHeader replaces the stored header with the same key in place, or appends.
+func (st *sourceState) storeHeader(pkt av.Packet) {
+	key := headerKey(pkt)
+	for i := range st.headers {
+		if headerKey(st.headers[i]) == key {
+			st.headers[i] = pkt
+			return
+		}
+	}
+	st.headers = append(st.headers, pkt)
+}
 
 // StallCallback is called when a stream stall is detected
 // sourceID indicates which source stalled
@@ -35,8 +91,8 @@ type StallConfig struct {
 // Key features:
 // - Subscribers are never disconnected during source switches
 // - Timestamps are remapped to be monotonically increasing
-// - Header packets are stored and sent to new subscribers
-// - Headers are replaced when source changes
+// - Header packets are stored per source and sent to new subscribers
+// - A source's session restart (reconnect) is detected and rebased
 // - Stall detection with callback for hot standby switching
 // - Active source filtering - only forwards packets from active source
 type PersistentBroadcaster struct {
@@ -44,7 +100,6 @@ type PersistentBroadcaster struct {
 
 	mu           sync.RWMutex
 	subscribers  map[*Subscription]struct{}
-	headerPkts   []av.Packet
 	closed       bool
 
 	// Timestamp remapping state
@@ -54,6 +109,14 @@ type PersistentBroadcaster struct {
 	timestampOffset time.Duration
 	initialized     bool
 
+	// Per-source headers and session detection (see detectSessionLocked)
+	sources           map[int]*sourceState
+	inputSeen         bool      // a media packet passed session detection
+	lastInputSourceID int       // source of the last packet that passed session detection
+	lastPacketSource  int       // filtering off: the source that last sent a packet
+	videoGate         bool      // hold video until a keyframe (new session or changed video config)
+	videoGateSince    time.Time // when videoGate was armed
+
 	// Active source filtering (for hot standby)
 	activeSourceID    int  // Only forward packets from this source (0 = accept all)
 	activeSourceSet   bool // Whether active source filtering is enabled
@@ -62,7 +125,6 @@ type PersistentBroadcaster struct {
 	pendingSourceID      int  // Source we want to switch to (waiting for keyframe)
 	pendingSourceSwitch  bool // Whether we're waiting for a keyframe from pendingSourceID
 	keyframeReceived     bool // Whether we've received a keyframe from current active source
-	pendingHeadersCleared bool // Whether we've cleared headers for the pending source switch
 
 	// Diagnostic tracking
 	lastPacketWallTime time.Time
@@ -91,7 +153,7 @@ func NewPersistentBroadcaster(babyUID string) *PersistentBroadcaster {
 	return &PersistentBroadcaster{
 		babyUID:     babyUID,
 		subscribers: make(map[*Subscription]struct{}),
-		headerPkts:  make([]av.Packet, 0),
+		sources:     make(map[int]*sourceState),
 	}
 }
 
@@ -110,12 +172,19 @@ func (pb *PersistentBroadcaster) SetActiveSource(sourceID int) {
 	if sourceID == 0 {
 		pb.activeSourceSet = false
 		pb.pendingSourceSwitch = false
+		pb.pendingSourceID = 0
 		log.Debug().Str("baby_uid", pb.babyUID).Msg("Active source filtering disabled")
 	} else {
+		changed := pb.forwardedSourceLocked() != sourceID
 		pb.activeSourceID = sourceID
 		pb.activeSourceSet = true
 		pb.keyframeReceived = false // Reset - need keyframe from new source
 		pb.pendingSourceSwitch = false
+		pb.pendingSourceID = 0
+		if changed {
+			// Re-initialize connected decoders with the new source's headers
+			pb.sendHeadersLocked(pb.sourceLocked(sourceID).headers)
+		}
 		log.Info().Str("baby_uid", pb.babyUID).Int("source_id", sourceID).Msg("Active source set (immediate)")
 	}
 }
@@ -131,12 +200,15 @@ func (pb *PersistentBroadcaster) RequestSourceSwitch(sourceID int) {
 	if sourceID == 0 {
 		pb.activeSourceSet = false
 		pb.pendingSourceSwitch = false
+		pb.pendingSourceID = 0
 		log.Debug().Str("baby_uid", pb.babyUID).Msg("Active source filtering disabled")
 		return
 	}
 
-	// If already on this source, nothing to do
+	// If already on this source, nothing to do (cancels a pending switch)
 	if pb.activeSourceSet && pb.activeSourceID == sourceID {
+		pb.pendingSourceSwitch = false
+		pb.pendingSourceID = 0
 		log.Debug().Str("baby_uid", pb.babyUID).Int("source_id", sourceID).Msg("Already on requested source")
 		return
 	}
@@ -153,7 +225,6 @@ func (pb *PersistentBroadcaster) RequestSourceSwitch(sourceID int) {
 	// Request switch - will complete when keyframe received from new source
 	pb.pendingSourceID = sourceID
 	pb.pendingSourceSwitch = true
-	pb.pendingHeadersCleared = false // Reset for new pending switch
 	log.Info().
 		Str("baby_uid", pb.babyUID).
 		Int("current_source", pb.activeSourceID).
@@ -243,6 +314,10 @@ func (pb *PersistentBroadcaster) checkForStall() {
 
 // Subscribe creates a new subscription to receive packets
 func (pb *PersistentBroadcaster) Subscribe() *Subscription {
+	// tsMu first (lock order tsMu -> mu): the stored headers and the forwarded
+	// source must not change while the subscriber is added
+	pb.tsMu.Lock()
+	defer pb.tsMu.Unlock()
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
@@ -257,8 +332,12 @@ func (pb *PersistentBroadcaster) Subscribe() *Subscription {
 
 	pb.subscribers[sub] = struct{}{}
 
-	// Send stored header packets to new subscriber
-	for _, hdr := range pb.headerPkts {
+	// Send the forwarded source's stored headers to the new subscriber
+	var headers []av.Packet
+	if st := pb.sources[pb.forwardedSourceLocked()]; st != nil {
+		headers = st.headers
+	}
+	for _, hdr := range headers {
 		select {
 		case sub.pktChan <- hdr:
 		default:
@@ -296,14 +375,20 @@ func (pb *PersistentBroadcaster) removeSubscriber(sub *Subscription) {
 
 // Broadcast sends a packet to all subscribers with timestamp remapping
 func (pb *PersistentBroadcaster) Broadcast(pkt av.Packet, sourceID int) {
-	// Handle header packets (type > 2)
-	if pkt.Type > 2 {
+	// Handle header packets (decoder configs and metadata); H264, AAC and OPUS are media
+	if pkt.Type > av.OPUS {
 		pb.handleHeaderPacket(pkt, sourceID)
 		return
 	}
 
-	// Check source filtering and handle keyframe-aligned switching
+	// One tsMu hold covers the source check, session detection, the gate,
+	// the remap and the distribution of this packet: a packet is remapped with
+	// the offset its own detection saw, and subscribers get packets in remap
+	// order (a switch's headers can never overtake an old-source packet).
+	// Distribution never blocks (full buffers drop), so the hold is short.
 	pb.tsMu.Lock()
+	defer pb.tsMu.Unlock()
+	st := pb.sourceLocked(sourceID)
 
 	// Check for pending source switch - if this is a keyframe from the pending source, complete the switch
 	if pb.pendingSourceSwitch && sourceID == pb.pendingSourceID && pkt.IsKeyFrame {
@@ -317,38 +402,20 @@ func (pb *PersistentBroadcaster) Broadcast(pkt av.Packet, sourceID int) {
 		pb.pendingSourceSwitch = false
 		pb.pendingSourceID = 0
 		pb.keyframeReceived = true
-		pb.pendingHeadersCleared = false // Reset for future switches
 
-		// Headers from the new source were already collected via handleHeaderPacket
-		// Send them to all existing subscribers for decoder re-initialization
-		pb.mu.RLock()
-		headers := make([]av.Packet, len(pb.headerPkts))
-		copy(headers, pb.headerPkts)
-		pb.mu.RUnlock()
-
-		pb.mu.RLock()
-		for sub := range pb.subscribers {
-			sub.closeMu.Lock()
-			if !sub.closed {
-				for _, hdr := range headers {
-					select {
-					case sub.pktChan <- hdr:
-					default:
-						// Buffer full, skip header (shouldn't happen)
-					}
-				}
-			}
-			sub.closeMu.Unlock()
-		}
-		pb.mu.RUnlock()
+		// Send the new source's stored headers to all existing subscribers
+		// before its keyframe, for decoder re-initialization
+		pb.sendHeadersLocked(st.headers)
 	}
 
 	// Check if this source is active (for hot standby filtering)
 	if pb.activeSourceSet && sourceID != pb.activeSourceID {
 		// Not the active source - don't forward but don't update wall time either
 		// (stall detection should only track the active source)
-		pb.tsMu.Unlock()
 		return
+	}
+	if !pb.activeSourceSet {
+		pb.lastPacketSource = sourceID
 	}
 
 	// Track if we've received a keyframe from active source
@@ -363,9 +430,11 @@ func (pb *PersistentBroadcaster) Broadcast(pkt av.Packet, sourceID int) {
 	// Don't forward until we have a keyframe (prevents decoder errors)
 	// Only enforce this when source filtering is active (hot standby mode)
 	if pb.activeSourceSet && !pb.keyframeReceived {
-		pb.tsMu.Unlock()
 		return
 	}
+
+	// Detect a session restart of this source and rebase if needed
+	pb.detectSessionLocked(pkt, sourceID, st)
 
 	// Diagnostic: check for long gaps (camera stalls)
 	now := time.Now()
@@ -388,10 +457,26 @@ func (pb *PersistentBroadcaster) Broadcast(pkt av.Packet, sourceID int) {
 			Msg("Stream resumed after stall")
 		pb.stallDetected = false
 	}
-	pb.tsMu.Unlock()
+
+	// Video gate: after a new session or a changed video config, hold video
+	// (not audio) until a keyframe. Held packets still count as activity above.
+	if pb.videoGate && pkt.Type == av.H264 {
+		if pkt.IsKeyFrame {
+			pb.videoGate = false
+		} else if time.Since(pb.videoGateSince) >= keyframeGateTimeout {
+			pb.videoGate = false
+			log.Warn().
+				Str("baby_uid", pb.babyUID).
+				Int("source_id", sourceID).
+				Dur("timeout", keyframeGateTimeout).
+				Msg("No keyframe after new video config, forwarding video anyway")
+		} else {
+			return
+		}
+	}
 
 	// Remap timestamp for continuity
-	pkt = pb.remapTimestamp(pkt, sourceID)
+	pkt = pb.remapTimestampLocked(pkt, sourceID)
 
 	// Distribute to all subscribers
 	pb.mu.RLock()
@@ -430,68 +515,161 @@ func (pb *PersistentBroadcaster) Broadcast(pkt av.Packet, sourceID int) {
 	}
 }
 
+// handleHeaderPacket stores a header for its source and, if that source is
+// forwarded, sends it to connected subscribers
 func (pb *PersistentBroadcaster) handleHeaderPacket(pkt av.Packet, sourceID int) {
-	pb.tsMu.Lock()
-
-	// Accept headers from active source OR pending source (for keyframe-aligned switching)
-	acceptHeader := false
-	isPendingSource := false
-	if !pb.activeSourceSet {
-		acceptHeader = true // No filtering, accept all
-	} else if sourceID == pb.activeSourceID {
-		acceptHeader = true // From active source
-	} else if pb.pendingSourceSwitch && sourceID == pb.pendingSourceID {
-		acceptHeader = true    // From pending source (building up headers for switch)
-		isPendingSource = true // Mark this so we don't update lastSourceID yet
-	}
-
-	if !acceptHeader {
-		pb.tsMu.Unlock()
-		return
-	}
-
-	// Only clear headers when switching to pending source (new source's headers will replace old)
-	// Don't update lastSourceID for pending source - that happens when the switch completes
-	// (timestamp remapping needs lastSourceID to stay on the active source until switch)
-	if isPendingSource {
-		// Check if we need to clear (protected by tsMu)
-		needsClear := !pb.pendingHeadersCleared
-		if needsClear {
-			pb.pendingHeadersCleared = true
-		}
-
-		pb.mu.Lock()
-		if needsClear {
-			log.Debug().Str("baby_uid", pb.babyUID).Int("source_id", sourceID).Msg("Cleared headers for pending source")
-			pb.headerPkts = make([]av.Packet, 0)
-		}
-		pb.headerPkts = append(pb.headerPkts, pkt)
-		pb.mu.Unlock()
-		pb.tsMu.Unlock()
-		return
-	}
-
-	sourceChanged := pb.initialized && sourceID != pb.lastSourceID
-	if sourceChanged {
-		// Source changed - clear old headers
-		pb.mu.Lock()
-		pb.headerPkts = make([]av.Packet, 0)
-		pb.mu.Unlock()
-		log.Debug().Str("baby_uid", pb.babyUID).Int("source_id", sourceID).Msg("Cleared headers for source switch")
-	}
-	pb.lastSourceID = sourceID
-	pb.tsMu.Unlock()
-
-	// Store header packet
-	pb.mu.Lock()
-	pb.headerPkts = append(pb.headerPkts, pkt)
-	pb.mu.Unlock()
-}
-
-func (pb *PersistentBroadcaster) remapTimestamp(pkt av.Packet, sourceID int) av.Packet {
 	pb.tsMu.Lock()
 	defer pb.tsMu.Unlock()
 
+	st := pb.sourceLocked(sourceID)
+	forwarded := !pb.activeSourceSet || sourceID == pb.activeSourceID
+	if !pb.activeSourceSet {
+		pb.lastPacketSource = sourceID
+	}
+
+	old, stored := st.header(headerKey(pkt))
+	identical := stored && bytes.Equal(old.Data, pkt.Data)
+
+	// A video or audio config after media: maybe a new session (decided at
+	// the next media packet). A changed video config needs a keyframe after it.
+	isVideoConfig := pkt.Type == av.H264DecoderConfig || pkt.Type == av.H264SPSPPSNALU
+	isConfig := isVideoConfig || pkt.Type == av.AACDecoderConfig
+	if isConfig && forwarded && (st.haveIn[0] || st.haveIn[1]) {
+		st.maybeNewSession = true
+		if isVideoConfig && stored && !identical {
+			pb.armVideoGateLocked()
+			log.Info().Str("baby_uid", pb.babyUID).Int("source_id", sourceID).Msg("Video config changed, holding video until a keyframe")
+		}
+	}
+
+	// A header identical to the stored one changes nothing for a decoder:
+	// not forwarded (encoders that resend their config before every keyframe)
+	if identical {
+		return
+	}
+	st.storeHeader(pkt)
+	if forwarded {
+		pb.sendHeadersLocked([]av.Packet{pkt})
+	}
+}
+
+// sourceLocked returns the state of a source, creating it. Caller holds tsMu.
+func (pb *PersistentBroadcaster) sourceLocked(sourceID int) *sourceState {
+	st := pb.sources[sourceID]
+	if st == nil {
+		st = &sourceState{}
+		pb.sources[sourceID] = st
+	}
+	return st
+}
+
+// forwardedSourceLocked returns the source whose packets subscribers get: the
+// active source, or with filtering off the source that last sent a packet.
+// Caller holds tsMu.
+func (pb *PersistentBroadcaster) forwardedSourceLocked() int {
+	if pb.activeSourceSet {
+		return pb.activeSourceID
+	}
+	return pb.lastPacketSource
+}
+
+func (pb *PersistentBroadcaster) armVideoGateLocked() {
+	if !pb.videoGate {
+		pb.videoGate = true
+		pb.videoGateSince = time.Now()
+	}
+}
+
+// sendHeadersLocked sends headers to all connected subscribers, stamped with
+// the current output timestamp so the output never steps back. Caller holds
+// tsMu (lock order tsMu -> mu -> closeMu).
+func (pb *PersistentBroadcaster) sendHeadersLocked(headers []av.Packet) {
+	if len(headers) == 0 {
+		return
+	}
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	dropped := false
+	for sub := range pb.subscribers {
+		sub.closeMu.Lock()
+		if !sub.closed {
+			for _, hdr := range headers {
+				hdr.Time = pb.lastTimestamp
+				select {
+				case sub.pktChan <- hdr:
+				default:
+					dropped = true
+				}
+			}
+		}
+		sub.closeMu.Unlock()
+	}
+	if dropped {
+		log.Warn().
+			Str("baby_uid", pb.babyUID).
+			Msg("Header dropped because a subscriber buffer is full; that subscriber cannot decode the new session")
+	}
+}
+
+// detectSessionLocked rebases the timeline when the forwarded source changes
+// or restarts its session, so output continues at the last output timestamp
+// plus one frame. A restart is detected per track (video and audio apart):
+//   - after a new video or audio config: the next timestamp is below the
+//     previous one, or more than sessionRestartThreshold above it
+//     (continuous = config resent)
+//   - otherwise: the timestamp is more than sessionRestartThreshold below the
+//     previous one (smaller steps are interleave and only hit the clamp)
+//
+// Caller holds tsMu.
+func (pb *PersistentBroadcaster) detectSessionLocked(pkt av.Packet, sourceID int, st *sourceState) {
+	track := 1
+	if pkt.Type == av.H264 {
+		track = 0
+	}
+
+	newSession, backward := false, false
+	if prev := st.lastIn[track]; st.haveIn[track] {
+		d := pkt.Time - prev
+		if st.maybeNewSession {
+			newSession = d < 0 || d > sessionRestartThreshold
+		} else {
+			newSession = d < -sessionRestartThreshold
+		}
+		backward = d < 0
+		st.maybeNewSession = false
+	}
+
+	if pb.inputSeen && (sourceID != pb.lastInputSourceID || newSession) {
+		// New timestamp = incoming timestamp + offset
+		// We want: pkt.Time + newOffset = lastTimestamp + frameInterval
+		frameInterval := 33 * time.Millisecond // ~30fps
+		pb.timestampOffset = pb.lastTimestamp + frameInterval - pkt.Time
+		pb.lastSourceID = sourceID
+		st.haveIn = [2]bool{} // one restart must not fire twice
+		st.maybeNewSession = false
+		if newSession {
+			log.Info().
+				Str("baby_uid", pb.babyUID).
+				Int("source_id", sourceID).
+				Dur("new_ts", pkt.Time).
+				Msg("Source started a new session, rebasing timestamps")
+			// A backward step is a certain restart: its first frames may not be
+			// decodable. A forward jump after a config may be a camera stall
+			// after a resent config: rebase for continuity, but do not gate.
+			if backward && !(pkt.Type == av.H264 && pkt.IsKeyFrame) {
+				pb.armVideoGateLocked()
+			}
+		}
+	}
+	pb.inputSeen = true
+	pb.lastInputSourceID = sourceID
+	st.lastIn[track] = pkt.Time
+	st.haveIn[track] = true
+}
+
+// remapTimestampLocked applies the offset set by detectSessionLocked. Caller
+// holds tsMu.
+func (pb *PersistentBroadcaster) remapTimestampLocked(pkt av.Packet, sourceID int) av.Packet {
 	if !pb.initialized {
 		// First packet ever
 		pb.initialized = true
@@ -501,17 +679,7 @@ func (pb *PersistentBroadcaster) remapTimestamp(pkt av.Packet, sourceID int) av.
 		return pkt
 	}
 
-	if sourceID != pb.lastSourceID {
-		// Source changed - calculate offset to maintain continuity
-		// New timestamp = old timestamp + offset
-		// We want: pkt.Time + newOffset = lastTimestamp + frameInterval
-		// So: newOffset = lastTimestamp + frameInterval - pkt.Time
-		frameInterval := 33 * time.Millisecond // ~30fps
-		pb.timestampOffset = pb.lastTimestamp + frameInterval - pkt.Time
-		pb.lastSourceID = sourceID
-	}
-
-	// Apply offset
+	// Apply offset (set by detectSessionLocked)
 	remappedPkt := pkt
 	remappedPkt.Time = pkt.Time + pb.timestampOffset
 

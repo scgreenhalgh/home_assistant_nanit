@@ -122,12 +122,13 @@ func TestPersistentBroadcaster_HeaderPacketsStoredAndSentToNewSubscribers(t *tes
 	received := make([]string, 0)
 	timeout := time.After(200 * time.Millisecond)
 
+collectLoop:
 	for i := 0; i < 4; i++ {
 		select {
 		case pkt := <-sub.Packets():
 			received = append(received, string(pkt.Data))
 		case <-timeout:
-			break
+			break collectLoop
 		}
 	}
 
