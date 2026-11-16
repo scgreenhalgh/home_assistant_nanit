@@ -2,11 +2,19 @@ package rtmpserver
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/notedit/rtmp/av"
 	"github.com/rs/zerolog/log"
 )
+
+// dropLogInterval is the minimum time between "packets dropped" warnings
+const dropLogInterval = 10 * time.Second
+
+// dropLogEpoch is the base for the warning rate limit. time.Since uses the
+// monotonic clock, so a wall-clock step cannot suppress the warning.
+var dropLogEpoch = time.Now()
 
 // StallCallback is called when a stream stall is detected
 // sourceID indicates which source stalled
@@ -58,7 +66,9 @@ type PersistentBroadcaster struct {
 
 	// Diagnostic tracking
 	lastPacketWallTime time.Time
-	droppedPackets     int64
+	droppedPackets     atomic.Int64 // atomic so the distribute section never takes tsMu while holding mu
+	droppedSinceLog    atomic.Int64 // drops not yet reported by the rate-limited warning
+	lastDropLogNanos   atomic.Int64 // time of the last drop warning, see dropLogEpoch (0 = never)
 
 	// Stall detection
 	stallMu          sync.Mutex     // Serializes stall checker start/stop operations
@@ -402,16 +412,21 @@ func (pb *PersistentBroadcaster) Broadcast(pkt av.Packet, sourceID int) {
 	}
 
 	if droppedThisRound > 0 {
-		pb.tsMu.Lock()
-		pb.droppedPackets += int64(droppedThisRound)
-		total := pb.droppedPackets
-		pb.tsMu.Unlock()
-		log.Warn().
-			Str("baby_uid", pb.babyUID).
-			Int("dropped_now", droppedThisRound).
-			Int64("total_dropped", total).
-			Bool("is_keyframe", pkt.IsKeyFrame).
-			Msg("Packet(s) dropped due to full subscriber buffer")
+		total := pb.droppedPackets.Add(int64(droppedThisRound))
+		pb.droppedSinceLog.Add(int64(droppedThisRound))
+
+		// Rate-limit the warning: at most one line per dropLogInterval
+		// The offset makes the first drop log at once (last is 0)
+		now := int64(time.Since(dropLogEpoch) + dropLogInterval)
+		last := pb.lastDropLogNanos.Load()
+		if now-last >= int64(dropLogInterval) && pb.lastDropLogNanos.CompareAndSwap(last, now) {
+			log.Warn().
+				Str("baby_uid", pb.babyUID).
+				Int64("dropped_since_last_log", pb.droppedSinceLog.Swap(0)).
+				Int64("total_dropped", total).
+				Bool("is_keyframe", pkt.IsKeyFrame).
+				Msg("Packet(s) dropped due to full subscriber buffer")
+		}
 	}
 }
 
