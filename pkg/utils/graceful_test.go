@@ -99,3 +99,21 @@ func TestGracefulRunnerFail(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, " main_finished sub_finished", out)
 }
+
+// Wait on a child that already finished must not race the parent cancelling it.
+func TestGracefulChildWaitRacesParentCancel(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		waited := make(chan struct{})
+		parent := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
+			child := ctx.RunAsChild(func(utils.GracefulContext) {})
+			go func() { child.Wait(); close(waited) }()
+			<-ctx.Done()
+		})
+		parent.Cancel()
+		select {
+		case <-waited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("child Wait did not return")
+		}
+	}
+}

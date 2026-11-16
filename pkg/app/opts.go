@@ -40,8 +40,7 @@ type RTMPOpts struct {
 	// IP:Port under which can Cam reach the RTMP server
 	PublicAddr string
 
-	// PreferRemote starts with remote (cloud) stream first, then switches to local
-	// Useful for testing source switching behavior
+	// PreferRemote has no effect: local is always primary, with the cloud stream as hot standby
 	PreferRemote bool
 
 	// Security: IP-based access control

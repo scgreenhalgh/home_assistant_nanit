@@ -17,6 +17,38 @@ import (
 type readyState struct {
 	Context    utils.GracefulContext
 	Connection *WebsocketConnection
+	Handlers   *handlerGroup
+}
+
+// handlerCleanupTimeout - how long run() waits for the ready handlers' cleanup before closing the socket
+var handlerCleanupTimeout = 5 * time.Second
+
+// handlerGroup - the ready handlers started within one websocket attempt
+type handlerGroup struct {
+	mu      sync.Mutex
+	runners []utils.GracefulRunner
+}
+
+// wait - waits until the handlers returned, up to timeout. Returns false on timeout.
+func (g *handlerGroup) wait(timeout time.Duration) bool {
+	g.mu.Lock()
+	runners := append([]utils.GracefulRunner(nil), g.runners...)
+	g.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		for _, runner := range runners {
+			runner.Wait()
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // WebsocketConnectionHandler - handler of ready connection
@@ -109,6 +141,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	// -------
 
 	var once sync.Once // Just because gowebsocket is buggy and can invoke OnDisconnect multiple times :-/
+	handlers := &handlerGroup{}
 
 	socket := gowebsocket.New(url)
 	socket.RequestHeader.Set("Authorization", auth)
@@ -119,7 +152,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 
 		go func() {
 			conn := NewWebsocketConnection(&socket)
-			readyState := readyState{attempt, conn}
+			readyState := readyState{attempt, conn, handlers}
 
 			manager.mu.Lock()
 			manager.readyState = &readyState
@@ -165,12 +198,23 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	log.Trace().Msg("Connecting to websocket")
 	socket.Connect()
 
-	<-attempt.Done()
+	closeAfterHandlers(attempt, handlers, func() {
+		if socket.IsConnected {
+			log.Debug().Msg("Closing websocket")
+			socket.Close()
+		}
+	})
+}
 
-	if socket.IsConnected {
-		log.Debug().Msg("Closing websocket")
-		socket.Close()
+// closeAfterHandlers - waits until the attempt ends, then lets its ready handlers finish
+// their cleanup (which can still write to the socket, eg. STOPPED on shutdown) for up to
+// handlerCleanupTimeout before it calls closeSocket
+func closeAfterHandlers(attempt utils.GracefulContext, handlers *handlerGroup, closeSocket func()) {
+	<-attempt.Done()
+	if !handlers.wait(handlerCleanupTimeout) {
+		log.Warn().Dur("timeout", handlerCleanupTimeout).Msg("Websocket handlers did not finish their cleanup in time, closing websocket anyway")
 	}
+	closeSocket()
 }
 
 // handleBinaryMessage processes incoming binary messages with nil-safety
@@ -198,7 +242,12 @@ func (manager *WebsocketConnectionManager) handleBinaryMessage(data []byte) {
 }
 
 func notifyReadyHandler(handler WebsocketConnectionHandler, state readyState) {
-	state.Context.RunAsChild(func(childCtx utils.GracefulContext) {
+	// The lock spans RunAsChild, so wait() sees every handler that started before the
+	// attempt was cancelled; RunAsChild does not start one after that.
+	state.Handlers.mu.Lock()
+	defer state.Handlers.mu.Unlock()
+	runner := state.Context.RunAsChild(func(childCtx utils.GracefulContext) {
 		handler(state.Connection, childCtx)
 	})
+	state.Handlers.runners = append(state.Handlers.runners, runner)
 }
