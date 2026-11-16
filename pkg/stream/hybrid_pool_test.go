@@ -498,15 +498,15 @@ func countRelays(calls *atomic.Int32) func(*HybridStreamPoolConfig) {
 	}
 }
 
-// With the standby disabled no relay exists, local drop gives Unhealthy and a
+// With the remote relay disabled no relay exists, local drop gives Unhealthy and a
 // request, and the filter never points at the remote source, even if packets
 // for it arrive.
-func TestHybridPool_DisableRemoteStandby_NoRelayNoRemote(t *testing.T) {
+func TestHybridPool_DisableRemoteRelay_NoRelayNoRemote(t *testing.T) {
 	var calls atomic.Int32
 	count := countRelays(&calls)
 	h := newHarness(t, func(c *HybridStreamPoolConfig) {
 		count(c)
-		c.DisableRemoteStandby = true
+		c.DisableRemoteRelay = true
 	})
 	c := subscribe(t, h.b)
 	h.start()
@@ -531,9 +531,9 @@ func TestHybridPool_DisableRemoteStandby_NoRelayNoRemote(t *testing.T) {
 }
 
 // Shutdown works with no relay.
-func TestHybridPool_DisableRemoteStandby_StopAndClose(t *testing.T) {
+func TestHybridPool_DisableRemoteRelay_StopAndClose(t *testing.T) {
 	for _, stop := range []bool{false, true} {
-		h := newHarness(t, func(c *HybridStreamPoolConfig) { c.DisableRemoteStandby = true })
+		h := newHarness(t, func(c *HybridStreamPoolConfig) { c.DisableRemoteRelay = true })
 		h.local.start()
 		time.Sleep(30 * time.Millisecond)
 		h.start()
@@ -553,8 +553,8 @@ func TestHybridPool_DisableRemoteStandby_StopAndClose(t *testing.T) {
 	}
 }
 
-// The default keeps the cloud standby: one relay.
-func TestHybridPool_DefaultStartsRemoteStandby(t *testing.T) {
+// The default keeps the remote relay: one relay.
+func TestHybridPool_DefaultStartsRemoteRelay(t *testing.T) {
 	var calls atomic.Int32
 	h := newHarness(t, countRelays(&calls))
 	h.start()

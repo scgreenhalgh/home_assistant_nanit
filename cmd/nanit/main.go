@@ -122,7 +122,7 @@ func main() {
 			LogDenied:      logDenied,
 			LogAllowed:     logAllowed,
 
-			DisableRemoteStandby: !utils.EnvVarBool("NANIT_REMOTE_STANDBY", true),
+			DisableRemoteRelay: utils.EnvVarBool("NANIT_DISABLE_REMOTE_RELAY", false),
 		}
 	}
 

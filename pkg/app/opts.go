@@ -43,9 +43,9 @@ type RTMPOpts struct {
 	// PreferRemote has no effect: local is always primary, with the cloud stream as hot standby
 	PreferRemote bool
 
-	// DisableRemoteStandby turns off the cloud stream that runs as hot standby.
-	// Zero value keeps the standby on.
-	DisableRemoteStandby bool
+	// DisableRemoteRelay turns off the cloud relay that runs as hot standby.
+	// Env: NANIT_DISABLE_REMOTE_RELAY (default false).
+	DisableRemoteRelay bool
 
 	// Security: IP-based access control
 	// AllowedIPs is a comma-separated list of IPs and/or CIDR ranges

@@ -126,7 +126,7 @@ See [.env.sample](../.env.sample) for all available options with descriptions.
 | `NANIT_PASSWORD` | (required) | Nanit account password |
 | `NANIT_RTMP_ADDR` | (auto-detect) | Local IP:port for RTMP server |
 | `NANIT_RTMP_PORT` | `1935` | RTMP port |
-| `NANIT_REMOTE_STANDBY` | `true` | Cloud stream as hot standby; `false` leaves no fallback when local fails |
+| `NANIT_DISABLE_REMOTE_RELAY` | `false` | Do not start the cloud relay (hot standby); `true` leaves no fallback when local fails |
 | `NANIT_PREFER_REMOTE` | `false` | No effect (deprecated) |
 | `NANIT_MQTT_ENABLED` | `false` | Enable MQTT |
 | `NANIT_MQTT_BROKER_URL` | - | MQTT broker URL |
