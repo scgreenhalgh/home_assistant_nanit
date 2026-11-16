@@ -616,15 +616,21 @@ func TestStreamManagerMonitorRestartsAfterRestore(t *testing.T) {
 	assert.Equal(t, baby.StreamType_Remote, sm.GetCurrentType())
 
 	// Wait for restore
-	time.Sleep(150 * time.Millisecond)
-	assert.Equal(t, baby.StreamType_Local, sm.GetCurrentType())
+	require.Eventually(t, func() bool { return sm.GetCurrentType() == baby.StreamType_Local },
+		2*time.Second, 5*time.Millisecond, "local stream must be restored")
+
+	// Make local fail again, so the manager stays on remote after the failover.
+	// If the restore succeeded, the manager would go remote -> local (restore
+	// after 50 ms) -> remote (the new monitor gets the stored Unhealthy state)
+	// and the test could read the short "local" state between the two.
+	localStreamer.mu.Lock()
+	localStreamer.shouldError = stream.ErrMaxConnections
+	localStreamer.mu.Unlock()
 
 	// Simulate second local stream drop by updating state to unhealthy
 	stateManager.Update("baby123", *baby.NewState().SetStreamState(baby.StreamState_Unhealthy))
 
-	// Wait for failover
-	time.Sleep(100 * time.Millisecond)
-
 	// Should have failed over to remote again
-	assert.Equal(t, baby.StreamType_Remote, sm.GetCurrentType())
+	require.Eventually(t, func() bool { return sm.GetCurrentType() == baby.StreamType_Remote },
+		2*time.Second, 5*time.Millisecond, "must fail over to remote again")
 }
