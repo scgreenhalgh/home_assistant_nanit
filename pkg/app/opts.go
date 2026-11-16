@@ -40,8 +40,7 @@ type RTMPOpts struct {
 	// IP:Port under which can Cam reach the RTMP server
 	PublicAddr string
 
-	// PreferRemote starts with remote (cloud) stream first, then switches to local
-	// Useful for testing source switching behavior
+	// PreferRemote has no effect: local is always primary, with the cloud stream as hot standby
 	PreferRemote bool
 
 	// Security: IP-based access control
@@ -58,6 +57,10 @@ type RTMPOpts struct {
 
 	// LogAllowed logs allowed connection attempts (default: false)
 	LogAllowed bool
+
+	// DisableSessionRelease turns off the STOPPED and retry after the camera
+	// refuses a stream request because of its connection limit (default: on)
+	DisableSessionRelease bool
 }
 
 type EventPollingOpts struct {

@@ -91,7 +91,7 @@ The app now supports automatic failover from local to remote (cloud) streaming:
 - **Local streaming** is preferred (lower latency, no cloud dependency)
 - If local streaming fails (camera connection limit, network issues), it automatically switches to **remote streaming** via Nanit's cloud
 - The switch is seamless - RTMP clients stay connected
-- Set `NANIT_PREFER_REMOTE=true` to test remote streaming first
+- `NANIT_PREFER_REMOTE` no longer has any effect: local is always primary, with the cloud stream as hot standby
 
 ## Control the app container
 
@@ -126,7 +126,8 @@ See [.env.sample](../.env.sample) for all available options with descriptions.
 | `NANIT_PASSWORD` | (required) | Nanit account password |
 | `NANIT_RTMP_ADDR` | (auto-detect) | Local IP:port for RTMP server |
 | `NANIT_RTMP_PORT` | `1935` | RTMP port |
-| `NANIT_PREFER_REMOTE` | `false` | Start with remote stream |
+| `NANIT_SESSION_RELEASE` | `true` | After the camera refuses a stream request because of its connection limit, send a stop for the bridge's own stream URL and try one more time. Set to false to turn this off. |
+| `NANIT_PREFER_REMOTE` | `false` | No effect (deprecated) |
 | `NANIT_MQTT_ENABLED` | `false` | Enable MQTT |
 | `NANIT_MQTT_BROKER_URL` | - | MQTT broker URL |
 | `NANIT_NOTIFICATIONS_ENABLED` | `false` | Enable notification polling |
