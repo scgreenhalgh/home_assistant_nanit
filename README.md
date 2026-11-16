@@ -265,6 +265,7 @@ mqtt:
 | `NANIT_RTMP_ALLOWED_IPS` | - | Explicit IP/CIDR whitelist (comma-separated) |
 | `NANIT_RTMP_LOG_DENIED` | `true` | Log denied connection attempts |
 | `NANIT_RTMP_LOG_ALLOWED` | `false` | Log allowed connection attempts |
+| `NANIT_REMOTE_STANDBY` | `true` | Keep the cloud stream as hot standby; `false` keeps video on the LAN but leaves no fallback when the local stream fails |
 | `NANIT_PREFER_REMOTE` | `false` | No effect (deprecated); local is always primary |
 | `NANIT_LOG_LEVEL` | `info` | Log level (trace, debug, info, warn, error) |
 | `NANIT_MQTT_ENABLED` | `false` | Enable MQTT integration |

@@ -79,6 +79,11 @@ type HybridStreamPoolConfig struct {
 	StallThreshold time.Duration
 	OnAuthFailed   func(err error) // Optional: called when auth fails completely
 
+	// DisableRemoteStandby turns the cloud relay off: no relay is created and
+	// the filter never points at the remote source. With it off there is no
+	// fallback when the local stream fails.
+	DisableRemoteStandby bool
+
 	// NewRelay builds the remote relay. Optional: defaults to an RTMPRelay
 	// with a real RTMP client.
 	NewRelay func(RemoteRelayConfig) RemoteRelay
@@ -166,7 +171,11 @@ func (p *HybridStreamPool) RequestLocalStream(ctx context.Context) error {
 	p.mu.Unlock()
 
 	p.broadcaster().SetStallConfig(stallConfig)
-	p.startRemoteRelay()
+	if p.cfg.DisableRemoteStandby {
+		log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Cloud standby disabled: no fallback if the local stream fails")
+	} else {
+		p.startRemoteRelay()
+	}
 	p.evaluate()
 	return nil
 }
@@ -257,7 +266,7 @@ func (p *HybridStreamPool) evaluate() {
 
 	b := p.broadcaster()
 	localOK := p.sourceHealthy(b, HybridSourceLocal)
-	remoteOK := p.sourceHealthy(b, HybridSourceRemote)
+	remoteOK := !p.cfg.DisableRemoteStandby && p.sourceHealthy(b, HybridSourceRemote)
 	p.pacer.ObserveLocal(localOK)
 
 	switch {

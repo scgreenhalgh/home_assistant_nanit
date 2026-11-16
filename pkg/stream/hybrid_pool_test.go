@@ -487,6 +487,81 @@ func TestHybridPool_Close(t *testing.T) {
 	assertStopped(t, h)
 }
 
+// countRelays makes the pool count relay factory calls.
+func countRelays(calls *atomic.Int32) func(*HybridStreamPoolConfig) {
+	return func(c *HybridStreamPoolConfig) {
+		inner := c.NewRelay
+		c.NewRelay = func(rc RemoteRelayConfig) RemoteRelay {
+			calls.Add(1)
+			return inner(rc)
+		}
+	}
+}
+
+// With the standby disabled no relay exists, local drop gives Unhealthy and a
+// request, and the filter never points at the remote source, even if packets
+// for it arrive.
+func TestHybridPool_DisableRemoteStandby_NoRelayNoRemote(t *testing.T) {
+	var calls atomic.Int32
+	count := countRelays(&calls)
+	h := newHarness(t, func(c *HybridStreamPoolConfig) {
+		count(c)
+		c.DisableRemoteStandby = true
+	})
+	c := subscribe(t, h.b)
+	h.start()
+	remote := &feeder{send: h.b.GetBroadcastFunc(HybridSourceRemote), marker: 'R', keyframes: true}
+	t.Cleanup(remote.halt)
+	remote.start()
+
+	h.waitState(baby.StreamState_Unhealthy, "Unhealthy must be published with local dead")
+	h.waitType(baby.StreamType_Local, "type stays Local")
+	h.waitStarted(1, "local stream must be requested")
+
+	h.local.start()
+	h.waitState(baby.StreamState_Alive, "Alive when local video arrives")
+	h.waitPackets(c, true, "local forwarded")
+	h.local.halt()
+	time.Sleep(300 * time.Millisecond)
+	assert.Equal(t, int32(0), calls.Load(), "relay factory must never be called")
+	assert.Zero(t, c.remote.Load(), "remote packets must never be forwarded")
+	assert.NotEqual(t, HybridSourceRemote, h.b.ActiveSourceID())
+	_, ty := h.state()
+	assert.Equal(t, baby.StreamType_Local, ty)
+}
+
+// Shutdown works with no relay.
+func TestHybridPool_DisableRemoteStandby_StopAndClose(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		h := newHarness(t, func(c *HybridStreamPoolConfig) { c.DisableRemoteStandby = true })
+		h.local.start()
+		time.Sleep(30 * time.Millisecond)
+		h.start()
+		time.Sleep(50 * time.Millisecond)
+		if stop {
+			stopWithin(t, func() { _ = h.pool.StopLocalStream(context.Background()) })
+			assert.Equal(t, 1, h.req.count(client.Streaming_STOPPED))
+		} else {
+			stopWithin(t, func() { h.pool.Close() })
+		}
+		select {
+		case <-h.pool.watchdogDone:
+		case <-time.After(waitTimeout):
+			t.Fatal("watchdog goroutine did not exit")
+		}
+		assert.Equal(t, int32(0), h.relay.started.Load())
+	}
+}
+
+// The default keeps the cloud standby: one relay.
+func TestHybridPool_DefaultStartsRemoteStandby(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, countRelays(&calls))
+	h.start()
+	require.Eventually(t, func() bool { return h.relay.started.Load() == 1 }, waitTimeout, 5*time.Millisecond, "relay started")
+	assert.Equal(t, int32(1), calls.Load())
+}
+
 func stopWithin(t *testing.T, f func()) {
 	t.Helper()
 	done := make(chan struct{})

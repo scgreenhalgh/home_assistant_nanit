@@ -121,6 +121,8 @@ func main() {
 			AllowedIPs:     allowedIPs,
 			LogDenied:      logDenied,
 			LogAllowed:     logAllowed,
+
+			DisableRemoteStandby: !utils.EnvVarBool("NANIT_REMOTE_STANDBY", true),
 		}
 	}
 
