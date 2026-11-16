@@ -95,7 +95,7 @@ func NewServer(cfg ServerConfig, babyStateManager *baby.StateManager) (*RTMPServ
 		server.ipAccess = ipAccess
 		log.Info().Str("config", ipAccess.String()).Msg("RTMP IP access control configured")
 	} else {
-		log.Warn().Msg("RTMP server running without IP access control - all connections will be denied")
+		log.Warn().Msg("RTMP server running without IP access control - all connections will be allowed")
 	}
 
 	return server, nil

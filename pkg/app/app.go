@@ -106,8 +106,8 @@ func (app *App) Run(ctx utils.GracefulContext) {
 				server.Run(app.Opts.RTMP.ListenAddr)
 			})
 		} else {
-			// Fallback to legacy server (will deny all connections without security config)
-			log.Warn().Msg("Starting RTMP server without security config - all connections will be denied")
+			// Fallback to legacy server (allows all connections without security config)
+			log.Warn().Msg("Starting RTMP server without security config - all connections will be allowed")
 			app.rtmpServer = rtmpserver.StartRTMPServer(app.Opts.RTMP.ListenAddr, app.BabyStateManager)
 		}
 	}
