@@ -301,6 +301,8 @@ func (app *App) createHybridPool(babyUID string, conn *client.WebsocketConnectio
 		StallThreshold: 3 * time.Second, // Re-evaluate if no packets for 3s
 		OnAuthFailed:   app.onAuthFailed,
 		Pacer:          pacer,
+
+		DisableSessionRelease: app.Opts.RTMP != nil && app.Opts.RTMP.DisableSessionRelease,
 	})
 }
 

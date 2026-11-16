@@ -57,6 +57,10 @@ type RTMPOpts struct {
 
 	// LogAllowed logs allowed connection attempts (default: false)
 	LogAllowed bool
+
+	// DisableSessionRelease turns off the STOPPED and retry after the camera
+	// refuses a stream request because of its connection limit (default: on)
+	DisableSessionRelease bool
 }
 
 type EventPollingOpts struct {

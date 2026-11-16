@@ -103,6 +103,15 @@ func (f *fakeRequester) all() []recordedRequest {
 	return append([]recordedRequest(nil), f.requests...)
 }
 
+// statuses lists the PUT_STREAMING statuses in the order they were recorded.
+func (f *fakeRequester) statuses() []client.Streaming_Status {
+	var out []client.Streaming_Status
+	for _, r := range f.all() {
+		out = append(out, r.Status)
+	}
+	return out
+}
+
 // --- fake relay ---
 
 type fakeRelay struct {
@@ -900,4 +909,264 @@ func TestHybridPool_StallCallbackFollowUp(t *testing.T) {
 	require.Equal(t, baby.StreamState_Alive, s)
 	require.Eventually(t, func() bool { s, _ := h.state(); return s == baby.StreamState_Unhealthy }, time.Second, 5*time.Millisecond,
 		"follow-up evaluation must notice local left the window")
+}
+
+// --- session release after a max-connections refusal ---
+
+const (
+	stopped = client.Streaming_STOPPED
+	started = client.Streaming_STARTED
+)
+
+type seq = []client.Streaming_Status
+
+func waitRequests(t *testing.T, h *harness, n int, msg string) {
+	t.Helper()
+	require.Eventually(t, func() bool { return len(h.req.all()) >= n }, waitTimeout, 5*time.Millisecond, msg)
+}
+
+// refuseStarted answers the first n STARTED requests with the max-connections
+// error; every other request gets the reply from other (nil: 200 at once).
+func refuseStarted(n int, other func(recordedRequest) (time.Duration, error)) func(recordedRequest) (time.Duration, error) {
+	var seen atomic.Int32
+	return func(r recordedRequest) (time.Duration, error) {
+		if r.Status == started && int(seen.Add(1)) <= n {
+			return 0, errForbidden
+		}
+		if other != nil {
+			return other(r)
+		}
+		return 0, nil
+	}
+}
+
+func releaseCfg(c *HybridStreamPoolConfig) {
+	longWatchdog(c)
+	c.ReleaseTimeout = 200 * time.Millisecond
+	c.RequestTimeout = time.Second
+}
+
+// T1: refused, local dead -> STARTED, STOPPED, STARTED; the second is
+// acknowledged and local video arrives -> Local/Alive.
+func TestHybridPool_Release_RefusedThenStoppedThenStarted(t *testing.T) {
+	h := newHarness(t, releaseCfg)
+	h.req.reply = refuseStarted(1, nil)
+	h.start()
+	waitRequests(t, h, 3, "STARTED, STOPPED, STARTED")
+	h.local.start()
+	h.waitState(baby.StreamState_Alive, "Alive once local video arrives")
+	h.waitType(baby.StreamType_Local, "Local")
+	assert.Equal(t, seq{started, stopped, started}, h.req.statuses())
+	for _, r := range h.req.all() {
+		assert.Equal(t, testLocalURL, r.URL)
+	}
+}
+
+// T2: no refusal -> only STARTED; other failures -> no STOPPED either.
+func TestHybridPool_Release_OnlyOnMaxConnectionsRefusal(t *testing.T) {
+	cases := map[string]func(recordedRequest) (time.Duration, error){
+		"acknowledged": nil,
+		"other error":  func(recordedRequest) (time.Duration, error) { return 0, errors.New("boom") },
+		"timeout":      func(recordedRequest) (time.Duration, error) { return time.Hour, nil },
+	}
+	for name, reply := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, func(c *HybridStreamPoolConfig) { releaseCfg(c); c.RequestTimeout = 100 * time.Millisecond })
+			h.req.reply = reply
+			h.start()
+			waitRequests(t, h, 1, "STARTED")
+			time.Sleep(250 * time.Millisecond)
+			assert.Equal(t, seq{started}, h.req.statuses())
+		})
+	}
+}
+
+// T3: both STARTED refused -> one release per attempt, and the next attempt
+// waits for the pacer.
+func TestHybridPool_Release_BothRefused_BoundedAndPaced(t *testing.T) {
+	const interval = 250 * time.Millisecond
+	h := newHarness(t, func(c *HybridStreamPoolConfig) {
+		releaseCfg(c)
+		c.WatchdogInterval = 20 * time.Millisecond
+		c.MinRetryInterval = interval
+		c.InitialBackoff = interval
+		c.MaxBackoff = interval
+	})
+	h.req.reply = refuseStarted(1000, nil)
+	h.start()
+	waitRequests(t, h, 3, "first attempt")
+	time.Sleep(interval / 2)
+	assert.Equal(t, seq{started, stopped, started}, h.req.statuses(), "one release per attempt, no tight loop")
+	waitRequests(t, h, 6, "second attempt")
+	time.Sleep(100 * time.Millisecond)
+	reqs := h.req.all()
+	assert.Equal(t, seq{started, stopped, started, started, stopped, started}, h.req.statuses())
+	assert.GreaterOrEqual(t, int64(reqs[3].At.Sub(reqs[0].At)), int64(interval-10*time.Millisecond), "next attempt only after the pacer interval")
+}
+
+// T4: an error or no reply to STOPPED does not stop the second STARTED.
+func TestHybridPool_Release_StoppedReply_DoesNotMatter(t *testing.T) {
+	t.Run("error", func(t *testing.T) {
+		h := newHarness(t, releaseCfg)
+		h.req.reply = refuseStarted(1, func(r recordedRequest) (time.Duration, error) { return 0, errors.New("no session") })
+		h.start()
+		waitRequests(t, h, 3, "second STARTED")
+		assert.Equal(t, seq{started, stopped, started}, h.req.statuses())
+	})
+	t.Run("no reply", func(t *testing.T) {
+		h := newHarness(t, releaseCfg)
+		h.req.reply = refuseStarted(1, func(r recordedRequest) (time.Duration, error) { return time.Hour, nil })
+		h.start()
+		waitRequests(t, h, 3, "second STARTED after ReleaseTimeout")
+		reqs := h.req.all()
+		assert.Equal(t, seq{started, stopped, started}, h.req.statuses())
+		gap := reqs[2].At.Sub(reqs[1].At)
+		assert.GreaterOrEqual(t, int64(gap), int64(190*time.Millisecond), "second STARTED waits for the reply or ReleaseTimeout")
+		assert.Less(t, int64(gap), int64(time.Second))
+	})
+}
+
+// waitAttemptDone waits until the request goroutine has ended its attempt.
+func waitAttemptDone(t *testing.T, h *harness) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		h.pool.mu.Lock()
+		defer h.pool.mu.Unlock()
+		return !h.pool.localRequestActive
+	}, waitTimeout, 5*time.Millisecond, "attempt did not end")
+}
+
+// T5: local video arrives before STOPPED, or during the wait for its reply.
+// A gate in the reply makes the order certain, with no sleeps.
+func TestHybridPool_Release_LocalHealthy_SendsNoMore(t *testing.T) {
+	longHealth := func(c *HybridStreamPoolConfig) { releaseCfg(c); c.HealthWindow = 2 * time.Second }
+	localFlows := func(h *harness) {
+		h.local.start()
+		require.Eventually(t, func() bool { return h.pool.sourceHealthy(h.b, HybridSourceLocal) }, waitTimeout, 5*time.Millisecond)
+	}
+
+	t.Run("before STOPPED", func(t *testing.T) {
+		h := newHarness(t, longHealth)
+		gate := make(chan struct{})
+		h.req.reply = func(r recordedRequest) (time.Duration, error) {
+			<-gate // the refusal is handled only after local flows
+			return 0, errForbidden
+		}
+		h.start()
+		waitRequests(t, h, 1, "STARTED")
+		localFlows(h)
+		close(gate)
+		waitAttemptDone(t, h)
+		assert.Equal(t, seq{started}, h.req.statuses())
+	})
+	t.Run("during the STOPPED wait", func(t *testing.T) {
+		h := newHarness(t, func(c *HybridStreamPoolConfig) { longHealth(c); c.ReleaseTimeout = 5 * time.Second })
+		gate := make(chan struct{})
+		h.req.reply = refuseStarted(1, func(r recordedRequest) (time.Duration, error) {
+			<-gate // the STOPPED reply comes only after local flows
+			return 0, nil
+		})
+		h.start()
+		waitRequests(t, h, 2, "STOPPED")
+		localFlows(h)
+		close(gate)
+		waitAttemptDone(t, h)
+		assert.Equal(t, seq{started, stopped}, h.req.statuses(), "no second STARTED once local flows")
+	})
+}
+
+// T6: shutdown while releasing never leads to a STARTED after it.
+func TestHybridPool_Release_Shutdown_NoStartedAfter(t *testing.T) {
+	slowStop := func(r recordedRequest) (time.Duration, error) { return 100 * time.Millisecond, nil }
+	setup := func(t *testing.T) *harness {
+		h := newHarness(t, func(c *HybridStreamPoolConfig) { releaseCfg(c); c.ReleaseTimeout = time.Second })
+		h.req.reply = refuseStarted(1, slowStop)
+		h.start()
+		waitRequests(t, h, 2, "STOPPED sent")
+		return h
+	}
+
+	t.Run("Close during the wait", func(t *testing.T) {
+		h := setup(t)
+		stopWithin(t, h.pool.Close)
+		time.Sleep(250 * time.Millisecond)
+		assert.Equal(t, seq{started, stopped}, h.req.statuses())
+	})
+	t.Run("StopLocalStream during the wait", func(t *testing.T) {
+		h := setup(t)
+		stopWithin(t, func() { _ = h.pool.StopLocalStream(context.Background()) })
+		time.Sleep(250 * time.Millisecond)
+		assert.Equal(t, seq{started, stopped, stopped}, h.req.statuses(), "shutdown STOPPED is last")
+	})
+	// The reply is in, the pool closes, and only then is sendMu free: the guard
+	// right before the second STARTED must see the closed pool.
+	t.Run("closed while waiting for sendMu", func(t *testing.T) {
+		h := setup(t)
+		h.pool.sendMu.Lock()
+		time.Sleep(250 * time.Millisecond) // STOPPED reply arrives; the goroutine waits for sendMu
+		stopWithin(t, h.pool.Close)
+		h.pool.sendMu.Unlock()
+		time.Sleep(200 * time.Millisecond)
+		assert.Equal(t, seq{started, stopped}, h.req.statuses())
+	})
+	t.Run("StopLocalStream while waiting for sendMu", func(t *testing.T) {
+		h := setup(t)
+		h.pool.sendMu.Lock()
+		time.Sleep(250 * time.Millisecond)
+		done := make(chan struct{})
+		go func() { _ = h.pool.StopLocalStream(context.Background()); close(done) }()
+		time.Sleep(100 * time.Millisecond)
+		h.pool.sendMu.Unlock()
+		stopWithin(t, func() { <-done })
+		time.Sleep(200 * time.Millisecond)
+		assert.Equal(t, seq{started, stopped, stopped}, h.req.statuses(), "shutdown STOPPED is last")
+	})
+}
+
+// T7: the switch turns the release off.
+func TestHybridPool_Release_Disabled_OnlyStarted(t *testing.T) {
+	h := newHarness(t, func(c *HybridStreamPoolConfig) { releaseCfg(c); c.DisableSessionRelease = true })
+	h.req.reply = refuseStarted(1000, nil)
+	h.start()
+	waitRequests(t, h, 1, "STARTED")
+	time.Sleep(250 * time.Millisecond)
+	assert.Equal(t, seq{started}, h.req.statuses())
+}
+
+// T8: a short stall of a live local push (longer than the health window) that
+// resumes is never answered with a STOPPED.
+func TestHybridPool_ShortStall_NoStopped(t *testing.T) {
+	h := newHarness(t, nil)
+	h.local.start()
+	time.Sleep(30 * time.Millisecond)
+	h.start()
+	h.waitState(baby.StreamState_Alive, "Alive")
+	h.local.halt()
+	waitRequests(t, h, 1, "the stall outlasts the health window, so STARTED goes out")
+	h.local.start()
+	h.waitState(baby.StreamState_Alive, "Alive again")
+	waitAttemptDone(t, h)
+	assert.Equal(t, seq{started}, h.req.statuses(), "no STOPPED for a stall that heals")
+}
+
+// Only the context given to RequestLocalStream is cancelled (no Close): the wait
+// for the STOPPED reply ends normally, and the guard right before the second
+// STARTED must still see the cancelled context.
+func TestHybridPool_Release_ParentContextCancelled_NoSecondStarted(t *testing.T) {
+	h := newHarness(t, func(c *HybridStreamPoolConfig) { releaseCfg(c); c.ReleaseTimeout = time.Second })
+	h.req.reply = refuseStarted(1, func(r recordedRequest) (time.Duration, error) { return 150 * time.Millisecond, nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = h.pool.RequestLocalStream(ctx) }()
+	waitRequests(t, h, 2, "STOPPED sent; its reply is 150 ms away")
+	h.pool.sendMu.Lock() // the goroutine will wait here after the reply
+	require.Eventually(t, h.req.stopReplied.Load, waitTimeout, time.Millisecond)
+	time.Sleep(100 * time.Millisecond) // let it reach sendMu
+	cancel()
+	h.pool.sendMu.Unlock()
+	waitAttemptDone(t, h)
+	assert.Equal(t, seq{started, stopped}, h.req.statuses())
+	h.pool.mu.Lock()
+	assert.False(t, h.pool.closed, "only the context was cancelled")
+	h.pool.mu.Unlock()
 }

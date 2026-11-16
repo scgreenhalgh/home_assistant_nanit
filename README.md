@@ -265,6 +265,7 @@ mqtt:
 | `NANIT_RTMP_ALLOWED_IPS` | - | Explicit IP/CIDR whitelist (comma-separated) |
 | `NANIT_RTMP_LOG_DENIED` | `true` | Log denied connection attempts |
 | `NANIT_RTMP_LOG_ALLOWED` | `false` | Log allowed connection attempts |
+| `NANIT_SESSION_RELEASE` | `true` | After the camera refuses a stream request because of its connection limit, send a stop for the bridge's own stream URL and try one more time. Set to false to turn this off. |
 | `NANIT_PREFER_REMOTE` | `false` | No effect (deprecated); local is always primary |
 | `NANIT_LOG_LEVEL` | `info` | Log level (trace, debug, info, warn, error) |
 | `NANIT_MQTT_ENABLED` | `false` | Enable MQTT integration |

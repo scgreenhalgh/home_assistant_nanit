@@ -29,6 +29,7 @@ const (
 	defaultPublisherWait    = 15 * time.Second // How long to wait for local packets after STARTED is acknowledged
 	defaultPublisherGrace   = 10 * time.Second // No STARTED this long after a local publisher connected
 	defaultStopTimeout      = 3 * time.Second  // How long to wait for the reply to STOPPED
+	defaultReleaseTimeout   = 2 * time.Second  // How long to wait for the reply to the STOPPED that releases a stale session
 )
 
 // StreamRequester sends a request over the camera websocket.
@@ -98,6 +99,11 @@ type HybridStreamPoolConfig struct {
 	RequestTimeout   time.Duration
 	PublisherWait    time.Duration
 	StopTimeout      time.Duration
+	ReleaseTimeout   time.Duration
+
+	// DisableSessionRelease turns off the STOPPED (and second STARTED) sent after
+	// the camera refuses STARTED with "connections above limit".
+	DisableSessionRelease bool
 }
 
 // NewHybridStreamPool creates a new hybrid stream pool
@@ -114,6 +120,7 @@ func NewHybridStreamPool(config HybridStreamPoolConfig) *HybridStreamPool {
 	setDefault(&config.PublisherWait, defaultPublisherWait)
 	setDefault(&config.PublisherGrace, defaultPublisherGrace)
 	setDefault(&config.StopTimeout, defaultStopTimeout)
+	setDefault(&config.ReleaseTimeout, defaultReleaseTimeout)
 	if config.NewRelay == nil {
 		config.NewRelay = func(c RemoteRelayConfig) RemoteRelay {
 			c.RTMPClient = NewRealRTMPClient()
@@ -347,9 +354,63 @@ func (p *HybridStreamPool) tryRequestLocalStream() {
 	go p.requestLocalStream(p.ctx)
 }
 
+// sendStreaming sends one PUT_STREAMING request under sendMu, which orders it
+// against StopLocalStream's STOPPED (the pool is marked closed before that takes
+// sendMu, so nothing follows it). It sends nothing and reports false when the
+// pool is closed or ctx is done, or, if needDead is set, local video flows.
+func (p *HybridStreamPool) sendStreaming(ctx context.Context, status client.Streaming_Status, needDead bool) (func(time.Duration) (*client.Response, error), bool) {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed || ctx.Err() != nil || (needDead && p.sourceHealthy(p.broadcaster(), HybridSourceLocal)) {
+		return nil, false
+	}
+	return p.cfg.Conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
+		Streaming: &client.Streaming{
+			Id:       client.StreamIdentifier(client.StreamIdentifier_MOBILE).Enum(),
+			RtmpUrl:  utils.ConstRefStr(p.cfg.LocalURL),
+			Status:   status.Enum(),
+			Attempts: utils.ConstRefInt32(1),
+		},
+	}), true
+}
+
+// releaseAndRestart asks the camera to drop its session for our URL: STOPPED, then
+// a wait of up to ReleaseTimeout for the reply (outside sendMu, so shutdown is
+// not delayed; the reply does not matter), then STARTED. It sends nothing more,
+// and reports false, once the pool is closed, ctx is done or local video flows.
+func (p *HybridStreamPool) releaseAndRestart(ctx context.Context) (func(time.Duration) (*client.Response, error), bool) {
+	awaitResponse, ok := p.sendStreaming(ctx, client.Streaming_STOPPED, true)
+	if !ok {
+		return nil, false
+	}
+	log.Info().Str("baby_uid", p.cfg.BabyUID).Str("url", p.cfg.LocalURL).Msg("Camera refused the local stream; releasing our session and trying again")
+	replied := make(chan error, 1)
+	go func() {
+		_, err := awaitResponse(p.cfg.ReleaseTimeout)
+		replied <- err
+	}()
+	select {
+	case err := <-replied:
+		if err != nil {
+			log.Debug().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("No confirmation for session release")
+		}
+	case <-ctx.Done():
+		return nil, false
+	}
+	return p.sendStreaming(ctx, client.Streaming_STARTED, true)
+}
+
 // requestLocalStream sends STARTED and waits for local video packets. The pool
 // lock is not held while sending or waiting. The outcome never changes the
 // filter or the backoff here: evaluate and the pacer own those.
+//
+// If the camera refuses STARTED because it holds too many sessions while no
+// local video arrives, one of them may be a stale session for our own URL. The
+// attempt then sends STOPPED for it and STARTED once more: at most
+// STARTED, STOPPED, STARTED per attempt.
 func (p *HybridStreamPool) requestLocalStream(ctx context.Context) {
 	arrived := false
 	defer func() {
@@ -361,34 +422,34 @@ func (p *HybridStreamPool) requestLocalStream(ctx context.Context) {
 		}
 	}()
 
-	// sendMu orders this send against StopLocalStream's STOPPED, which marks
-	// the pool closed before taking it: no STARTED can follow the STOPPED.
-	p.sendMu.Lock()
-	p.mu.Lock()
-	closed := p.closed
-	p.mu.Unlock()
-	if closed {
-		p.sendMu.Unlock()
+	awaitResponse, ok := p.sendStreaming(ctx, client.Streaming_STARTED, false)
+	if !ok {
 		return
 	}
-	awaitResponse := p.cfg.Conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
-		Streaming: &client.Streaming{
-			Id:       client.StreamIdentifier(client.StreamIdentifier_MOBILE).Enum(),
-			RtmpUrl:  utils.ConstRefStr(p.cfg.LocalURL),
-			Status:   client.Streaming_Status(client.Streaming_STARTED).Enum(),
-			Attempts: utils.ConstRefInt32(1),
-		},
-	})
-	p.sendMu.Unlock()
 	log.Info().Str("baby_uid", p.cfg.BabyUID).Str("url", p.cfg.LocalURL).Dur("next_backoff", p.pacer.Backoff()).Msg("Requested local stream")
 
 	if _, err := awaitResponse(p.cfg.RequestTimeout); err != nil {
-		if IsMaxConnectionsError(err) {
-			log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("Camera refused local stream (too many connections)")
-		} else {
+		if !IsMaxConnectionsError(err) {
 			log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("Local stream request failed")
+			return
 		}
-		return
+		log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("Camera refused local stream (too many connections)")
+		if p.cfg.DisableSessionRelease {
+			return
+		}
+		// Release, then try once more; each step re-checks closed, ctx and local health.
+		if awaitResponse, ok = p.releaseAndRestart(ctx); !ok {
+			arrived = p.sourceHealthy(p.broadcaster(), HybridSourceLocal) // let evaluate run
+			return
+		}
+		if _, err := awaitResponse(p.cfg.RequestTimeout); err != nil {
+			if IsMaxConnectionsError(err) {
+				log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("Camera refused local stream again after releasing our session")
+			} else {
+				log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("Local stream request failed")
+			}
+			return
+		}
 	}
 
 	// Acknowledged: wait for video packets, not for a registered publisher.

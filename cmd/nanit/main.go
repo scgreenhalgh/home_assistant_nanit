@@ -121,6 +121,8 @@ func main() {
 			AllowedIPs:     allowedIPs,
 			LogDenied:      logDenied,
 			LogAllowed:     logAllowed,
+
+			DisableSessionRelease: !utils.EnvVarBool("NANIT_SESSION_RELEASE", true),
 		}
 	}
 
