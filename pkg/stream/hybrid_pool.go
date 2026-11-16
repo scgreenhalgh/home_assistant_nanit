@@ -5,11 +5,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"github.com/scgreenhalgh/home_assistant_nanit/pkg/baby"
 	"github.com/scgreenhalgh/home_assistant_nanit/pkg/client"
 	"github.com/scgreenhalgh/home_assistant_nanit/pkg/rtmpserver"
 	"github.com/scgreenhalgh/home_assistant_nanit/pkg/utils"
-	"github.com/rs/zerolog/log"
 )
 
 // Source IDs for hybrid pool
@@ -20,703 +20,509 @@ const (
 	HybridSourceRemote = 21 // Remote cloud relay (unique ID for remote source)
 )
 
-// Recovery configuration
+// Default timings
 const (
-	minLocalRetryInterval  = 30 * time.Second  // Minimum time between local retry attempts
-	initialLocalBackoff    = 10 * time.Second  // Initial backoff for failed local retries
-	maxLocalBackoff        = 5 * time.Minute   // Maximum backoff for failed local retries
-	healthCheckInterval    = 30 * time.Second  // How often to check stream health
-	noStreamRecoveryDelay  = 1 * time.Minute   // How long to wait before attempting recovery when no stream
+	defaultStallThreshold   = 3 * time.Second  // Broadcaster stall callback threshold
+	defaultHealthWindow     = 5 * time.Second  // A source is healthy if it sent a video packet this recently
+	defaultWatchdogInterval = 1 * time.Second  // How often to evaluate stream health
+	defaultRequestTimeout   = 30 * time.Second // How long to wait for the reply to STARTED
+	defaultPublisherWait    = 15 * time.Second // How long to wait for local packets after STARTED is acknowledged
+	defaultPublisherGrace   = 10 * time.Second // No STARTED this long after a local publisher connected
+	defaultStopTimeout      = 3 * time.Second  // How long to wait for the reply to STOPPED
 )
+
+// StreamRequester sends a request over the camera websocket.
+// *client.WebsocketConnection implements it.
+type StreamRequester interface {
+	SendRequest(client.RequestType, *client.Request) func(time.Duration) (*client.Response, error)
+}
 
 // HybridStreamPool manages a local stream as primary with remote relay as hot standby.
 // This provides true redundancy because local and remote use different network paths.
-// When local stalls, it switches to remote using keyframe-aligned switching.
+//
+// Health is derived from the broadcaster: a source is healthy when it sent a video
+// packet within HealthWindow. One evaluation function (run by a watchdog ticker,
+// the stall callback and the relay's max-retries callback) points the broadcaster
+// filter at a healthy source, publishes StreamType/StreamState, and asks the
+// camera for the local stream (rate limited) only while local is not healthy.
 type HybridStreamPool struct {
-	babyUID      string
-	localURL     string // RTMP URL for local stream
-	conn         *client.WebsocketConnection
-	stateManager *baby.StateManager
-	rtmpServer   *rtmpserver.RTMPServer
+	cfg HybridStreamPoolConfig
 
-	// Remote relay configuration
-	authToken     string
-	tokenProvider TokenProvider    // Provides fresh tokens on reconnect
-	onAuthFailed  func(err error)  // Called when auth fails completely
-	remoteRelay   RemoteRelay      // Interface, actual type is *RTMPRelay
+	evalMu sync.Mutex // serialises evaluate
+	sendMu sync.Mutex // orders STARTED and STOPPED sends
 
-	mu              sync.RWMutex
-	started         bool
-	activeSource    int  // HybridSourceLocal or HybridSourceRemote
-	localActive     bool // Whether local publisher is connected
-	remoteActive    bool // Whether remote relay is connected
-	ctx             context.Context
-	cancel          context.CancelFunc
+	mu           sync.Mutex
+	started      bool
+	closed       bool
+	ctx          context.Context
+	cancel       context.CancelFunc
+	remoteRelay  RemoteRelay
+	stallConfig  *rtmpserver.StallConfig
+	unsubscribe  func()
+	watchdogDone chan struct{}
 
-	// Stall detection config
-	stallThreshold time.Duration
-
-	// Recovery tracking
-	lastLocalStall      time.Time
-	localStallCount     int
-	lastLocalRetry      time.Time     // Rate limiting for local retries
-	localRetryInFlight  bool          // Prevents concurrent requestLocalStream calls
-	localRetryBackoff   time.Duration // Current backoff duration for local retries
+	pacer              *RequestPacer
+	localRequestActive bool      // one request in flight at a time
+	graceFollowUpFor   time.Time // publisher connect time a follow-up evaluation is scheduled for
 }
 
-// HybridStreamPoolConfig configuration for HybridStreamPool
+// HybridStreamPoolConfig configuration for HybridStreamPool.
+// Zero durations take the defaults above.
 type HybridStreamPoolConfig struct {
 	BabyUID        string
 	LocalURL       string        // RTMP URL for local stream (without slot suffix)
 	AuthToken      string        // Initial auth token for remote relay
 	TokenProvider  TokenProvider // Optional: provides fresh tokens on reconnect (recommended)
-	Conn           *client.WebsocketConnection
+	Conn           StreamRequester
 	StateManager   *baby.StateManager
 	RTMPServer     *rtmpserver.RTMPServer
 	StallThreshold time.Duration
 	OnAuthFailed   func(err error) // Optional: called when auth fails completely
+
+	// DisableRemoteRelay turns the cloud relay off: no relay is created and
+	// the filter never points at the remote source. With it off there is no
+	// fallback when the local stream fails.
+	DisableRemoteRelay bool
+
+	// NewRelay builds the remote relay. Optional: defaults to an RTMPRelay
+	// with a real RTMP client.
+	NewRelay func(RemoteRelayConfig) RemoteRelay
+
+	// Pacer rate-limits STARTED requests. Optional: share one across the pools
+	// of a baby so pacing survives websocket reconnects. If nil, the pool makes
+	// its own from MinRetryInterval, InitialBackoff, MaxBackoff and StableWindow.
+	Pacer *RequestPacer
+
+	HealthWindow     time.Duration
+	WatchdogInterval time.Duration
+	MinRetryInterval time.Duration
+	InitialBackoff   time.Duration
+	MaxBackoff       time.Duration
+	StableWindow     time.Duration
+	PublisherGrace   time.Duration
+	RequestTimeout   time.Duration
+	PublisherWait    time.Duration
+	StopTimeout      time.Duration
 }
 
 // NewHybridStreamPool creates a new hybrid stream pool
 func NewHybridStreamPool(config HybridStreamPoolConfig) *HybridStreamPool {
-	if config.StallThreshold == 0 {
-		config.StallThreshold = 3 * time.Second // Default 3 second stall threshold
+	setDefault := func(d *time.Duration, v time.Duration) {
+		if *d == 0 {
+			*d = v
+		}
+	}
+	setDefault(&config.StallThreshold, defaultStallThreshold)
+	setDefault(&config.HealthWindow, defaultHealthWindow)
+	setDefault(&config.WatchdogInterval, defaultWatchdogInterval)
+	setDefault(&config.RequestTimeout, defaultRequestTimeout)
+	setDefault(&config.PublisherWait, defaultPublisherWait)
+	setDefault(&config.PublisherGrace, defaultPublisherGrace)
+	setDefault(&config.StopTimeout, defaultStopTimeout)
+	if config.NewRelay == nil {
+		config.NewRelay = func(c RemoteRelayConfig) RemoteRelay {
+			c.RTMPClient = NewRealRTMPClient()
+			return NewRemoteRelay(c)
+		}
+	}
+
+	pacer := config.Pacer
+	if pacer == nil {
+		pacer = NewRequestPacer(RequestPacerConfig{
+			MinInterval:    config.MinRetryInterval,
+			InitialBackoff: config.InitialBackoff,
+			MaxBackoff:     config.MaxBackoff,
+			StableWindow:   config.StableWindow,
+		})
 	}
 
 	return &HybridStreamPool{
-		babyUID:        config.BabyUID,
-		localURL:       config.LocalURL,
-		authToken:      config.AuthToken,
-		tokenProvider:  config.TokenProvider,
-		onAuthFailed:   config.OnAuthFailed,
-		conn:           config.Conn,
-		stateManager:   config.StateManager,
-		rtmpServer:     config.RTMPServer,
-		stallThreshold: config.StallThreshold,
-		activeSource:   HybridSourceLocal, // Start with local as primary
+		cfg:          config,
+		pacer:        pacer,
+		watchdogDone: make(chan struct{}),
 	}
 }
 
-// RequestLocalStream starts both local and remote streams (local as active, remote as standby)
+// RequestLocalStream starts the pool: stall detection, the remote standby, and
+// the health watchdog. It returns at once; the camera is asked for the local
+// stream only if local packets are not already flowing.
 func (p *HybridStreamPool) RequestLocalStream(ctx context.Context) error {
 	p.mu.Lock()
-	if p.started {
+	if p.started || p.closed {
 		p.mu.Unlock()
 		return nil
 	}
-	p.ctx, p.cancel = context.WithCancel(ctx)
 	p.started = true
-	p.activeSource = HybridSourceLocal
+	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.stallConfig = &rtmpserver.StallConfig{
+		Threshold: p.cfg.StallThreshold,
+		Callback:  p.onStallDetected,
+	}
+	stallConfig := p.stallConfig
+	// Repair StreamState at once when someone else (the RTMP handler) writes it.
+	// The state manager calls subscribers on their own goroutines, without its
+	// locks held, and only for updates that change something.
+	p.unsubscribe = p.cfg.StateManager.Subscribe(func(babyUID string, state baby.State) {
+		if babyUID == p.cfg.BabyUID && state.StreamState != nil {
+			p.evaluate()
+		}
+	})
+	go p.runHealthWatchdog(p.ctx)
 	p.mu.Unlock()
 
-	// Publish initial stream source state
-	p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Local))
-
-	// Configure stall detection on the broadcaster
-	p.configureStallDetection()
-
-	// Start remote relay as hot standby (relay.Start returns immediately)
-	p.startRemoteRelay()
-
-	// Request local stream (primary)
-	if err := p.requestLocalStream(); err != nil {
-		log.Warn().Err(err).Str("baby_uid", p.babyUID).Msg("Failed to start local stream, falling back to remote")
-
-		// Actually switch to remote since local failed
-		p.mu.Lock()
-		p.activeSource = HybridSourceRemote
-		p.mu.Unlock()
-
-		// Update broadcaster to accept remote packets
-		if broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID); broadcaster != nil {
-			broadcaster.SetActiveSource(HybridSourceRemote)
-			log.Info().Str("baby_uid", p.babyUID).Msg("Switched active source to remote after local failure")
-		}
-
-		// Publish stream source change to remote
-		p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Remote))
+	p.broadcaster().SetStallConfig(stallConfig)
+	if p.cfg.DisableRemoteRelay {
+		log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Remote relay disabled: no fallback if the local stream fails")
+	} else {
+		p.startRemoteRelay()
 	}
-
-	// Start health watchdog to monitor and recover streams
-	go p.runHealthWatchdog(p.ctx)
-
+	p.evaluate()
 	return nil
 }
 
-// configureStallDetection sets up the stall callback on the broadcaster
-func (p *HybridStreamPool) configureStallDetection() {
-	broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID)
-	if broadcaster == nil {
-		// Create the broadcaster if it doesn't exist
-		p.rtmpServer.GetOrCreateBroadcaster(p.babyUID)
-		broadcaster = p.rtmpServer.GetBroadcaster(p.babyUID)
+func (p *HybridStreamPool) broadcaster() *rtmpserver.PersistentBroadcaster {
+	if b := p.cfg.RTMPServer.GetBroadcaster(p.cfg.BabyUID); b != nil {
+		return b
 	}
-
-	if broadcaster == nil {
-		log.Warn().Str("baby_uid", p.babyUID).Msg("No broadcaster found for stall detection")
-		return
-	}
-
-	broadcaster.SetStallConfig(&rtmpserver.StallConfig{
-		Threshold: p.stallThreshold,
-		Callback:  p.onStallDetected,
-	})
-
-	// Set initial active source to local
-	broadcaster.SetActiveSource(HybridSourceLocal)
-
-	log.Info().
-		Str("baby_uid", p.babyUID).
-		Dur("threshold", p.stallThreshold).
-		Msg("Configured stall detection for hybrid stream pool (local primary, remote standby)")
-}
-
-// onStallDetected is called when the broadcaster detects a stall on the active source
-func (p *HybridStreamPool) onStallDetected(sourceID int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if !p.started {
-		return
-	}
-
-	// Ignore stalls from non-active source
-	if sourceID != p.activeSource {
-		log.Debug().
-			Str("baby_uid", p.babyUID).
-			Int("stalled_source", sourceID).
-			Int("active_source", p.activeSource).
-			Msg("Stall detected on non-active source, ignoring")
-		return
-	}
-
-	now := time.Now()
-
-	if sourceID == HybridSourceLocal {
-		// Local stalled - switch to remote
-		p.lastLocalStall = now
-		p.localStallCount++
-
-		log.Warn().
-			Str("baby_uid", p.babyUID).
-			Int("stall_count", p.localStallCount).
-			Bool("remote_active", p.remoteActive).
-			Msg("Local stream stalled, attempting switch to remote")
-
-		if p.remoteActive {
-			p.activeSource = HybridSourceRemote
-
-			// Use keyframe-aligned switching for graceful transition
-			if broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID); broadcaster != nil {
-				broadcaster.RequestSourceSwitch(HybridSourceRemote)
-			}
-
-			// Publish stream source change
-			p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Remote))
-
-			log.Info().
-				Str("baby_uid", p.babyUID).
-				Msg("Requested switch to remote stream (waiting for keyframe)")
-
-			// Try to restart local in background for later recovery (rate-limited)
-			go p.tryRequestLocalStream()
-		} else {
-			log.Error().
-				Str("baby_uid", p.babyUID).
-				Msg("Local stalled but remote not available - stream may be interrupted")
-
-			// Try to start remote
-			go p.startRemoteRelay()
-		}
-	} else if sourceID == HybridSourceRemote {
-		// Remote stalled - switch back to local
-		log.Warn().
-			Str("baby_uid", p.babyUID).
-			Bool("local_active", p.localActive).
-			Msg("Remote stream stalled, attempting switch to local")
-
-		if p.localActive {
-			p.activeSource = HybridSourceLocal
-
-			// Use keyframe-aligned switching
-			if broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID); broadcaster != nil {
-				broadcaster.RequestSourceSwitch(HybridSourceLocal)
-			}
-
-			// Publish stream source change
-			p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Local))
-
-			log.Info().
-				Str("baby_uid", p.babyUID).
-				Msg("Requested switch to local stream (waiting for keyframe)")
-		} else {
-			log.Error().
-				Str("baby_uid", p.babyUID).
-				Msg("Remote stalled but local not available - stream may be interrupted")
-
-			// Try to restart local (rate-limited)
-			go p.tryRequestLocalStream()
-		}
-	}
+	p.cfg.RTMPServer.GetOrCreateBroadcaster(p.cfg.BabyUID)
+	return p.cfg.RTMPServer.GetBroadcaster(p.cfg.BabyUID)
 }
 
 // startRemoteRelay starts the remote relay as hot standby
 func (p *HybridStreamPool) startRemoteRelay() {
 	p.mu.Lock()
-
-	// Check if pool has been stopped
-	if !p.started {
+	if p.closed || p.remoteRelay != nil {
 		p.mu.Unlock()
-		log.Debug().Str("baby_uid", p.babyUID).Msg("Pool stopped, skipping remote relay start")
 		return
 	}
 
-	if p.remoteRelay != nil {
-		p.mu.Unlock()
-		return // Already running
-	}
-
-	// Get the broadcaster's broadcast function for remote source
-	broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID)
-	if broadcaster == nil {
-		p.mu.Unlock()
-		log.Error().Str("baby_uid", p.babyUID).Msg("No broadcaster for remote relay")
-		return
-	}
-
-	broadcastFunc := broadcaster.GetBroadcastFunc(HybridSourceRemote)
-	broadcasterAdapter := NewBroadcasterAdapter(broadcastFunc)
-
-	relay := NewRemoteRelay(RemoteRelayConfig{
-		BabyUID:          p.babyUID,
-		AuthToken:        p.authToken,
-		TokenProvider:    p.tokenProvider,
-		PacketReceiver:   broadcasterAdapter,
-		RTMPClient:       NewRealRTMPClient(),
-		ReconnectEnabled: true,
-		MaxReconnectAttempts: 5, // After 5 consecutive failures, notify pool to try local
+	relay := p.cfg.NewRelay(RemoteRelayConfig{
+		BabyUID:              p.cfg.BabyUID,
+		AuthToken:            p.cfg.AuthToken,
+		TokenProvider:        p.cfg.TokenProvider,
+		PacketReceiver:       NewBroadcasterAdapter(p.broadcaster().GetBroadcastFunc(HybridSourceRemote)),
+		ReconnectEnabled:     true,
+		MaxReconnectAttempts: 5,
 		OnConnected: func() {
-			p.mu.Lock()
-			p.remoteActive = true
-			p.mu.Unlock()
-			log.Info().Str("baby_uid", p.babyUID).Msg("Remote relay connected")
+			log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Remote relay connected")
 		},
 		OnMaxRetriesExceeded: func(lastErr error) {
-			p.onRemoteMaxRetriesExceeded(lastErr)
+			log.Warn().Err(lastErr).Str("baby_uid", p.cfg.BabyUID).Msg("Remote relay max retries exceeded")
+			go p.evaluate()
 		},
 		OnAuthFailed: func(err error) {
 			log.Error().
 				Err(err).
-				Str("baby_uid", p.babyUID).
+				Str("baby_uid", p.cfg.BabyUID).
 				Msg("Remote relay authentication failed - manual re-authentication may be required")
-			if p.onAuthFailed != nil {
-				p.onAuthFailed(err)
+			if p.cfg.OnAuthFailed != nil {
+				p.cfg.OnAuthFailed(err)
 			}
 		},
 	})
-
 	p.remoteRelay = relay
 	ctx := p.ctx
 	p.mu.Unlock()
 
-	log.Info().Str("baby_uid", p.babyUID).Msg("Starting remote relay as hot standby")
+	log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Starting remote relay as hot standby")
 
-	// Start the relay in background - it handles its own reconnection internally
-	// Note: remoteActive is set via OnConnected callback when actually connected
+	// Start makes the first connection attempt before it returns, then keeps
+	// relaying and reconnecting in the background until Stop.
 	go func() {
-		err := relay.Start(ctx)
-
-		// Only log and mark inactive if it wasn't a normal context cancellation
-		if err != nil && ctx.Err() == nil {
-			log.Warn().Err(err).Str("baby_uid", p.babyUID).Msg("Remote relay stopped unexpectedly")
+		if err := relay.Start(ctx); err != nil && ctx.Err() == nil {
+			log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("Remote relay failed to start")
 		}
-
-		p.mu.Lock()
-		p.remoteActive = false
-		p.mu.Unlock()
 	}()
 }
 
-// onRemoteMaxRetriesExceeded is called when remote relay has failed too many times
-func (p *HybridStreamPool) onRemoteMaxRetriesExceeded(lastErr error) {
-	p.mu.Lock()
-	activeSource := p.activeSource
-	localActive := p.localActive
-	started := p.started
-	p.remoteActive = false // Mark remote as unavailable
-	p.mu.Unlock()
+// onStallDetected is called by the broadcaster when the forwarded source stalls
+func (p *HybridStreamPool) onStallDetected(sourceID int) {
+	p.evaluate()
 
-	if !started {
-		return
-	}
-
-	log.Warn().
-		Err(lastErr).
-		Str("baby_uid", p.babyUID).
-		Int("active_source", activeSource).
-		Bool("local_active", localActive).
-		Msg("Remote relay max retries exceeded, attempting fallback to local")
-
-	// If we were using remote as active source, try to switch to local
-	if activeSource == HybridSourceRemote {
-		if localActive {
-			// Local is available, switch to it
-			p.mu.Lock()
-			p.activeSource = HybridSourceLocal
-			p.mu.Unlock()
-
-			if broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID); broadcaster != nil {
-				broadcaster.RequestSourceSwitch(HybridSourceLocal)
-			}
-
-			p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Local))
-			log.Info().Str("baby_uid", p.babyUID).Msg("Switched to local after remote max retries")
-		} else {
-			// Local not active, try to start it (rate-limited)
-			log.Info().Str("baby_uid", p.babyUID).Msg("Local not active, requesting local stream")
-			go p.tryRequestLocalStream()
-		}
+	// The stall threshold can be shorter than the health window. Evaluate again
+	// when the stalled source's last packet falls out of the window.
+	if age, seen := p.broadcaster().SourceAge(sourceID); seen && age < p.cfg.HealthWindow {
+		time.AfterFunc(p.cfg.HealthWindow-age, p.evaluate)
 	}
 }
 
-// requestLocalStream requests the local stream from the camera
-func (p *HybridStreamPool) requestLocalStream() error {
-	p.mu.RLock()
-	if !p.started {
-		p.mu.RUnlock()
-		return nil
+func (p *HybridStreamPool) sourceHealthy(b *rtmpserver.PersistentBroadcaster, sourceID int) bool {
+	age, seen := b.SourceAge(sourceID)
+	return seen && age < p.cfg.HealthWindow
+}
+
+// evaluate is the single place that decides the filter, the published state,
+// and whether to ask the camera for the local stream.
+func (p *HybridStreamPool) evaluate() {
+	p.evalMu.Lock()
+	defer p.evalMu.Unlock()
+
+	p.mu.Lock()
+	running := p.started && !p.closed
+	p.mu.Unlock()
+	if !running {
+		return
 	}
-	p.mu.RUnlock()
 
-	log.Info().
-		Str("baby_uid", p.babyUID).
-		Str("url", p.localURL).
-		Msg("Requesting local stream")
+	b := p.broadcaster()
+	localOK := p.sourceHealthy(b, HybridSourceLocal)
+	remoteOK := !p.cfg.DisableRemoteRelay && p.sourceHealthy(b, HybridSourceRemote)
+	p.pacer.ObserveLocal(localOK)
 
-	awaitResponse := p.conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
+	switch {
+	case localOK:
+		p.pointFilter(b, HybridSourceLocal, false)
+		p.publish(baby.StreamType_Local, baby.StreamState_Alive)
+	case remoteOK:
+		p.pointFilter(b, HybridSourceRemote, false)
+		p.publish(baby.StreamType_Remote, baby.StreamState_Alive)
+		p.tryRequestLocalStream()
+	default:
+		// Nothing flows: forward local the moment it arrives.
+		p.pointFilter(b, HybridSourceLocal, true)
+		p.publish(baby.StreamType_Local, baby.StreamState_Unhealthy)
+		p.tryRequestLocalStream()
+	}
+}
+
+// pointFilter makes the broadcaster forward target, or switch to it at the next
+// keyframe when immediate is false. It writes only when something must change,
+// because the setters reset keyframe tracking.
+func (p *HybridStreamPool) pointFilter(b *rtmpserver.PersistentBroadcaster, target int, immediate bool) {
+	active := b.ActiveSourceID()
+	pending := b.PendingSourceID()
+
+	if active == target {
+		if pending != 0 {
+			b.RequestSourceSwitch(target) // cancels the pending switch away from target
+			log.Info().Str("baby_uid", p.cfg.BabyUID).Int("source_id", target).Msg("Cancelled pending source switch")
+		}
+		return
+	}
+	if immediate {
+		b.SetActiveSource(target)
+		return
+	}
+	if pending == target {
+		return
+	}
+	b.RequestSourceSwitch(target)
+	log.Info().Str("baby_uid", p.cfg.BabyUID).Int("from", active).Int("to", target).Msg("Requested source switch (waiting for keyframe)")
+}
+
+// publish reconciles StreamType and StreamState with the state manager, so a
+// value written elsewhere is corrected on the next evaluation.
+func (p *HybridStreamPool) publish(streamType baby.StreamType, streamState baby.StreamState) {
+	current := p.cfg.StateManager.GetBabyState(p.cfg.BabyUID)
+	update := baby.NewState()
+	changed := false
+	if current == nil || current.GetStreamType() != streamType {
+		update.SetStreamType(streamType)
+		changed = true
+	}
+	if current == nil || current.GetStreamState() != streamState {
+		update.SetStreamState(streamState)
+		changed = true
+	}
+	if changed {
+		p.cfg.StateManager.Update(p.cfg.BabyUID, *update)
+	}
+}
+
+// tryRequestLocalStream starts a local stream request unless one is in flight
+// or the pacer says it is too soon.
+func (p *HybridStreamPool) tryRequestLocalStream() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed || p.localRequestActive {
+		return
+	}
+	// A publisher that just connected is about to send video: a STARTED now
+	// could open a second push. Evaluate again when the grace ends.
+	if at := p.cfg.RTMPServer.LocalPublisherConnectedAt(p.cfg.BabyUID); !at.IsZero() {
+		if remaining := p.cfg.PublisherGrace - time.Since(at); remaining > 0 {
+			if !p.graceFollowUpFor.Equal(at) {
+				p.graceFollowUpFor = at
+				time.AfterFunc(remaining, p.evaluate)
+			}
+			return
+		}
+	}
+	if !p.pacer.TryAcquire() {
+		return
+	}
+	p.localRequestActive = true
+	go p.requestLocalStream(p.ctx)
+}
+
+// requestLocalStream sends STARTED and waits for local video packets. The pool
+// lock is not held while sending or waiting. The outcome never changes the
+// filter or the backoff here: evaluate and the pacer own those.
+func (p *HybridStreamPool) requestLocalStream(ctx context.Context) {
+	arrived := false
+	defer func() {
+		p.mu.Lock()
+		p.localRequestActive = false
+		p.mu.Unlock()
+		if arrived {
+			p.evaluate() // no-op once the pool is closed
+		}
+	}()
+
+	// sendMu orders this send against StopLocalStream's STOPPED, which marks
+	// the pool closed before taking it: no STARTED can follow the STOPPED.
+	p.sendMu.Lock()
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		p.sendMu.Unlock()
+		return
+	}
+	awaitResponse := p.cfg.Conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
 		Streaming: &client.Streaming{
 			Id:       client.StreamIdentifier(client.StreamIdentifier_MOBILE).Enum(),
-			RtmpUrl:  utils.ConstRefStr(p.localURL),
+			RtmpUrl:  utils.ConstRefStr(p.cfg.LocalURL),
 			Status:   client.Streaming_Status(client.Streaming_STARTED).Enum(),
 			Attempts: utils.ConstRefInt32(1),
 		},
 	})
+	p.sendMu.Unlock()
+	log.Info().Str("baby_uid", p.cfg.BabyUID).Str("url", p.cfg.LocalURL).Dur("next_backoff", p.pacer.Backoff()).Msg("Requested local stream")
 
-	_, err := awaitResponse(30 * time.Second)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("baby_uid", p.babyUID).
-			Msg("Failed to request local stream")
-		return err
-	}
-
-	log.Info().Str("baby_uid", p.babyUID).Msg("Local stream requested successfully")
-
-	// Wait for publisher to connect
-	timeout := 15 * time.Second
-	err = p.rtmpServer.WaitForPublisher(p.babyUID, timeout)
-	if err != nil {
-		log.Warn().
-			Err(err).
-			Str("baby_uid", p.babyUID).
-			Msg("Local publisher didn't connect")
-		return err
-	}
-
-	p.mu.Lock()
-	p.localActive = true
-	wasOnRemote := p.activeSource == HybridSourceRemote
-	p.mu.Unlock()
-
-	log.Info().Str("baby_uid", p.babyUID).Msg("Local stream active")
-
-	// If we were on remote, request switch back to local
-	if wasOnRemote {
-		if broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID); broadcaster != nil {
-			broadcaster.RequestSourceSwitch(HybridSourceLocal)
-			log.Info().
-				Str("baby_uid", p.babyUID).
-				Msg("Local recovered, requested switch back from remote (waiting for keyframe)")
-		}
-
-		p.mu.Lock()
-		p.activeSource = HybridSourceLocal
-		p.mu.Unlock()
-
-		// Publish stream source change back to local
-		p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Local))
-	}
-
-	p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamState(baby.StreamState_Alive))
-
-	return nil
-}
-
-// tryRequestLocalStream attempts to request a local stream with rate limiting and backoff
-// This prevents spamming the camera/API when local stream is unavailable
-func (p *HybridStreamPool) tryRequestLocalStream() {
-	p.mu.Lock()
-
-	// Check if pool has been stopped
-	if !p.started {
-		p.mu.Unlock()
-		log.Debug().Str("baby_uid", p.babyUID).Msg("Pool stopped, skipping local retry")
-		return
-	}
-
-	// Check if another request is already in flight
-	if p.localRetryInFlight {
-		p.mu.Unlock()
-		log.Debug().Str("baby_uid", p.babyUID).Msg("Local retry already in flight, skipping")
-		return
-	}
-
-	// Check rate limiting
-	if time.Since(p.lastLocalRetry) < minLocalRetryInterval {
-		p.mu.Unlock()
-		log.Debug().
-			Str("baby_uid", p.babyUID).
-			Dur("time_since_last", time.Since(p.lastLocalRetry)).
-			Dur("min_interval", minLocalRetryInterval).
-			Msg("Local retry rate limited, skipping")
-		return
-	}
-
-	// Check backoff
-	if p.localRetryBackoff > 0 && time.Since(p.lastLocalRetry) < p.localRetryBackoff {
-		p.mu.Unlock()
-		log.Debug().
-			Str("baby_uid", p.babyUID).
-			Dur("backoff", p.localRetryBackoff).
-			Msg("Local retry in backoff, skipping")
-		return
-	}
-
-	p.localRetryInFlight = true
-	p.lastLocalRetry = time.Now()
-	p.mu.Unlock()
-
-	log.Info().
-		Str("baby_uid", p.babyUID).
-		Dur("backoff", p.localRetryBackoff).
-		Msg("Attempting local stream request")
-
-	err := p.requestLocalStream()
-
-	p.mu.Lock()
-	p.localRetryInFlight = false
-
-	if err != nil {
-		// Increase backoff on failure
-		if p.localRetryBackoff == 0 {
-			p.localRetryBackoff = initialLocalBackoff
+	if _, err := awaitResponse(p.cfg.RequestTimeout); err != nil {
+		if IsMaxConnectionsError(err) {
+			log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("Camera refused local stream (too many connections)")
 		} else {
-			p.localRetryBackoff = time.Duration(float64(p.localRetryBackoff) * 1.5)
-			if p.localRetryBackoff > maxLocalBackoff {
-				p.localRetryBackoff = maxLocalBackoff
+			log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("Local stream request failed")
+		}
+		return
+	}
+
+	// Acknowledged: wait for video packets, not for a registered publisher.
+	b := p.broadcaster()
+	deadline := time.NewTimer(p.cfg.PublisherWait)
+	defer deadline.Stop()
+	poll := time.NewTicker(p.cfg.PublisherWait / 15)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			log.Warn().Str("baby_uid", p.cfg.BabyUID).Dur("waited", p.cfg.PublisherWait).Msg("Local stream acknowledged but no packets arrived")
+			return
+		case <-poll.C:
+			if p.sourceHealthy(b, HybridSourceLocal) {
+				log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Local stream packets arriving")
+				arrived = true
+				return
 			}
 		}
-		log.Warn().
-			Err(err).
-			Str("baby_uid", p.babyUID).
-			Dur("next_backoff", p.localRetryBackoff).
-			Msg("Local stream request failed, increased backoff")
-	} else {
-		// Reset backoff on success
-		p.localRetryBackoff = 0
-		log.Info().Str("baby_uid", p.babyUID).Msg("Local stream request succeeded, reset backoff")
 	}
-	p.mu.Unlock()
 }
 
-// runHealthWatchdog periodically checks stream health and attempts recovery if needed
+// runHealthWatchdog evaluates stream health periodically
 func (p *HybridStreamPool) runHealthWatchdog(ctx context.Context) {
-	ticker := time.NewTicker(healthCheckInterval)
+	defer close(p.watchdogDone)
+	ticker := time.NewTicker(p.cfg.WatchdogInterval)
 	defer ticker.Stop()
-
-	var noStreamSince time.Time
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			p.mu.RLock()
-			localActive := p.localActive
-			remoteActive := p.remoteActive
-			started := p.started
-			p.mu.RUnlock()
-
-			if !started {
-				return
-			}
-
-			hasActiveStream := localActive || remoteActive
-
-			if hasActiveStream {
-				// Reset the "no stream" timer
-				noStreamSince = time.Time{}
-			} else {
-				// No active stream
-				if noStreamSince.IsZero() {
-					noStreamSince = time.Now()
-					log.Warn().
-						Str("baby_uid", p.babyUID).
-						Msg("Health watchdog: No active stream detected")
-				} else if time.Since(noStreamSince) >= noStreamRecoveryDelay {
-					// No stream for too long, attempt recovery
-					log.Warn().
-						Str("baby_uid", p.babyUID).
-						Dur("no_stream_duration", time.Since(noStreamSince)).
-						Msg("Health watchdog: Attempting stream recovery")
-
-					// Try to request local stream (rate-limited)
-					go p.tryRequestLocalStream()
-
-					// Reset timer so we don't spam recovery attempts
-					noStreamSince = time.Now()
-				}
-			}
-
-			// Log health status periodically at debug level
-			log.Debug().
-				Str("baby_uid", p.babyUID).
-				Bool("local_active", localActive).
-				Bool("remote_active", remoteActive).
-				Msg("Health watchdog status")
+			p.evaluate()
 		}
 	}
 }
 
-// WaitForPublisher implements LocalStreamer interface
-func (p *HybridStreamPool) WaitForPublisher(ctx context.Context, timeout time.Duration) error {
-	return p.rtmpServer.WaitForPublisher(p.babyUID, timeout)
-}
-
-// StopLocalStream stops both local and remote streams
-func (p *HybridStreamPool) StopLocalStream(ctx context.Context) error {
+// shutdown stops the watchdog, state subscription, stall detection and relay,
+// then puts the filter on local so the camera's packets pass while no pool
+// exists, and publishes the final state. It reports whether this call stopped
+// a running pool. An in-flight STARTED is not waited for.
+func (p *HybridStreamPool) shutdown(stopping bool) bool {
 	p.mu.Lock()
-	if !p.started {
+	wasRunning := p.started && !p.closed
+	p.closed = true
+	if !wasRunning {
 		p.mu.Unlock()
-		return nil
+		return false
 	}
-	p.started = false
-	if p.cancel != nil {
-		p.cancel()
-	}
+	p.cancel()
 	remoteRelay := p.remoteRelay
 	p.remoteRelay = nil
+	stallConfig := p.stallConfig
+	unsubscribe := p.unsubscribe
 	p.mu.Unlock()
 
-	// Stop stall detection
-	broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID)
-	if broadcaster != nil {
-		broadcaster.SetStallConfig(nil)
-	}
-
-	// Stop remote relay
+	unsubscribe()
+	b := p.broadcaster()
+	// Only removes our own callback; a newer pool may already own the broadcaster.
+	b.ClearStallConfig(stallConfig)
 	if remoteRelay != nil {
 		remoteRelay.Stop()
 	}
+	<-p.watchdogDone
 
-	// Stop local stream
-	p.conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
+	// evalMu waits out an evaluation that started before closed was set.
+	p.evalMu.Lock()
+	defer p.evalMu.Unlock()
+	p.pointFilter(b, HybridSourceLocal, true)
+	switch {
+	case stopping:
+		p.publish(baby.StreamType_None, baby.StreamState_Unhealthy)
+	case p.sourceHealthy(b, HybridSourceLocal):
+		p.publish(baby.StreamType_Local, baby.StreamState_Alive)
+	default:
+		p.publish(baby.StreamType_Local, baby.StreamState_Unhealthy)
+	}
+	return true
+}
+
+// Close stops the pool without telling the camera. Use it when the websocket is
+// gone or is being replaced: STOPPED would end a camera push the next pool keeps.
+func (p *HybridStreamPool) Close() {
+	if p.shutdown(false) {
+		log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Hybrid stream pool closed")
+	}
+}
+
+// StopLocalStream stops the pool and tells the camera to stop pushing to our URL,
+// waiting for the reply up to StopTimeout or until ctx is cancelled. It is idempotent.
+func (p *HybridStreamPool) StopLocalStream(ctx context.Context) error {
+	if !p.shutdown(true) {
+		return nil
+	}
+
+	// The pool is closed now; waiting for sendMu lets a STARTED already being
+	// sent go out first, so STOPPED is the last word.
+	p.sendMu.Lock()
+	awaitResponse := p.cfg.Conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
 		Streaming: &client.Streaming{
 			Id:       client.StreamIdentifier(client.StreamIdentifier_MOBILE).Enum(),
-			RtmpUrl:  utils.ConstRefStr(p.localURL),
+			RtmpUrl:  utils.ConstRefStr(p.cfg.LocalURL),
 			Status:   client.Streaming_Status(client.Streaming_STOPPED).Enum(),
 			Attempts: utils.ConstRefInt32(1),
 		},
 	})
-
-	log.Info().Str("baby_uid", p.babyUID).Msg("Hybrid stream pool stopped")
-	return nil
-}
-
-// OnPublisherConnected is called when a local publisher connects
-func (p *HybridStreamPool) OnPublisherConnected(url string) {
-	if url != p.localURL {
-		return
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.localActive = true
-	log.Debug().
-		Str("baby_uid", p.babyUID).
-		Msg("Local publisher connected")
-}
-
-// OnPublisherDisconnected is called when a local publisher disconnects
-func (p *HybridStreamPool) OnPublisherDisconnected(url string) {
-	if url != p.localURL {
-		return
-	}
-
-	p.mu.Lock()
-	wasActive := p.localActive
-	p.localActive = false
-	activeSource := p.activeSource
-	started := p.started
-	p.mu.Unlock()
-
-	log.Info().
-		Str("baby_uid", p.babyUID).
-		Bool("was_active", wasActive).
-		Msg("Local publisher disconnected")
-
-	if !started {
-		return
-	}
-
-	// If we were using local, switch to remote
-	if activeSource == HybridSourceLocal {
-		p.mu.Lock()
-		if p.remoteActive {
-			p.activeSource = HybridSourceRemote
-			p.mu.Unlock()
-
-			if broadcaster := p.rtmpServer.GetBroadcaster(p.babyUID); broadcaster != nil {
-				broadcaster.RequestSourceSwitch(HybridSourceRemote)
-			}
-
-			// Publish stream source change to remote
-			p.stateManager.Update(p.babyUID, *baby.NewState().SetStreamType(baby.StreamType_Remote))
-
-			log.Info().
-				Str("baby_uid", p.babyUID).
-				Msg("Switched to remote after local disconnect")
-		} else {
-			p.mu.Unlock()
-			log.Warn().
-				Str("baby_uid", p.babyUID).
-				Msg("Local disconnected but remote not available")
+	p.sendMu.Unlock()
+	replied := make(chan error, 1)
+	go func() {
+		_, err := awaitResponse(p.cfg.StopTimeout)
+		replied <- err
+	}()
+	select {
+	case err := <-replied:
+		if err != nil {
+			log.Warn().Err(err).Str("baby_uid", p.cfg.BabyUID).Msg("No confirmation for local stream stop")
 		}
-
-		// Try to restart local (rate-limited)
-		go p.tryRequestLocalStream()
+	case <-ctx.Done():
+		log.Warn().Str("baby_uid", p.cfg.BabyUID).Msg("Stopped waiting for local stream stop confirmation")
 	}
-}
 
-// GetActiveSource returns the currently active source
-func (p *HybridStreamPool) GetActiveSource() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.activeSource
-}
-
-// IsLocalActive returns whether local stream is connected
-func (p *HybridStreamPool) IsLocalActive() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.localActive
-}
-
-// IsRemoteActive returns whether remote relay is connected
-func (p *HybridStreamPool) IsRemoteActive() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.remoteActive
+	log.Info().Str("baby_uid", p.cfg.BabyUID).Msg("Hybrid stream pool stopped")
+	return nil
 }

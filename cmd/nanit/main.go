@@ -121,6 +121,8 @@ func main() {
 			AllowedIPs:     allowedIPs,
 			LogDenied:      logDenied,
 			LogAllowed:     logAllowed,
+
+			DisableRemoteRelay: utils.EnvVarBool("NANIT_DISABLE_REMOTE_RELAY", false),
 		}
 	}
 
